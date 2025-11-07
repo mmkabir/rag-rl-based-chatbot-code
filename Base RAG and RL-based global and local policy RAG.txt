@@ -1,0 +1,3836 @@
+!pip install rank_bm25 transformers torch faiss-cpu
+!pip install tiktoken
+!pip install langchain_community
+!pip install nltk openai langchain
+!pip install -q nltk langchain openai sentence-transformers numpy
+!pip install --upgrade torch torchvision torchaudio
+!pip install gym
+!pip install regex
+!pip install -U "torch>=2.2" "torchvision>=0.17" "torchaudio>=2.2" --index-url https://download.pytorch.org/whl/cu121
+!pip install -U sentence-transformers
+!pip install xlsxwriter -q
+
+#1. Embedding
+
+import torch
+import torch.nn.functional as F
+import nltk
+nltk.download('punkt_tab')
+nltk.download('punkt')
+from nltk.tokenize import sent_tokenize
+from sentence_transformers import util
+import openai
+from rank_bm25 import BM25Okapi
+from nltk.tokenize import word_tokenize
+
+
+# BM25 Sparse Embedding Example
+
+# Import SentenceTransformer after torch installation
+
+from sentence_transformers import SentenceTransformer
+
+def bm25_embedding(documents, k1, b):
+    tokenized_corpus = [word_tokenize(doc.lower()) for doc in documents]
+    bm25 = BM25Okapi(tokenized_corpus, k1=k1,b=b)
+    return bm25
+
+# Dense Embedding (DPR)
+
+
+def dpr_embedding(model_name="facebook/dpr-ctx_encoder-single-nq-base"):
+    model = SentenceTransformer(model_name)
+    return model
+
+
+
+def openai_embed(texts, model="text-embedding-ada-002"):
+    if isinstance(texts, str):
+        texts = [texts]
+    # Use the new API: openai.embeddings.create
+    response = openai.embeddings.create(
+        input=texts,
+        model=model
+    )
+    # The response structure is slightly different in v1.0.0,
+    # access embeddings from the 'data' attribute
+    return [r.embedding for r in response.data]
+
+bge_model = SentenceTransformer("BAAI/bge-large-en-v1.5") # Moved definition here
+
+def embed(text):
+    """
+    Returns embedding as a NumPy array on CPU,
+    even if embedding model runs on GPU.
+    """
+    with torch.no_grad():
+        emb = bge_model.encode(text, convert_to_tensor=True)  # PyTorch tensor on GPU/CPU
+    return emb.detach().cpu().numpy()
+
+
+# === our RAG pipeline helper ===
+def get_context_vector(query, document, embed):  # adapt as needed
+    # e.g., concatenate BGE embeddings of query and document
+    return np.concatenate([embed(query), embed(document)], axis=0)
+
+
+# 2. Generation Setup
+
+from langchain.chat_models import ChatOpenAI
+from langchain import PromptTemplate, LLMChain
+import re
+import tiktoken
+from nltk.tokenize import sent_tokenize
+import nltk
+
+
+
+relevance_prompt = PromptTemplate(
+    input_variables=["question", "sentence"],
+    template=(
+        "Question: {question}\n"
+        "Sentence: {sentence}\n"
+        "our task is to identify if the Sentence can help answer the given Question. Reply with 'Yes' or 'No' only."
+        "\n\nYou should choose a sentence that:"
+        "\n- Directly support the answer,"
+        "\n- Contain facts or explanations that help understand the answer,"
+        "\n- Or provide essential background needed to make the answer complete or accurate."
+
+        "\n\nDo NOT select a sentence that contains:"
+        "\n- Unrelated information,"
+        "\n- Partial sentence fragments,"
+        "\n- Or general summaries that add no useful details."
+    )
+)
+
+llm = ChatOpenAI(model=gpt_model, temperature=0.3)
+
+# # LLM chain for sentence filtering
+sentence_filter_chain = LLMChain(llm=llm, prompt=relevance_prompt)
+
+def filter_sentences_by_relevance(question, retrieved_chunks, verbose=True):
+    filtered_sentences = []
+    print(f"\nInside filter_sentences_by_relevance")
+    # print(f"\nRetrieved_chunks: {retrieved_chunks}")
+    for chunk in retrieved_chunks:
+        sentences = sent_tokenize(chunk)
+        # if verbose:
+        #     print("\n🔍 Chunk Sentences:", sentences)
+
+        for sentence in sentences:
+            try:
+                verdict = sentence_filter_chain.run({
+                    "question": question,
+                    "sentence": sentence.strip()
+                }).strip().lower()
+
+                # if verbose:
+                #     print(f"❓ Evaluating: \"{sentence.strip()}\" → Verdict: \"{verdict}\"")
+
+                if verdict.startswith("yes"):
+                    filtered_sentences.append(sentence.strip())
+
+            except Exception as e:
+                print(f"⚠️ Error evaluating sentence: {sentence[:100]} — {e}")
+                continue
+
+    # Fallback: Use raw chunks if nothing was marked as relevant
+    if not filtered_sentences:
+        if verbose:
+            print("\n⚠️ No relevant sentences found. Falling back to unfiltered chunks.")
+        filtered_sentences = retrieved_chunks
+
+    return filtered_sentences
+
+
+# Function to count tokens
+def count_tokens(text, model=gpt_model):
+    encoding = tiktoken.encoding_for_model(model)
+    return len(encoding.encode(text))
+
+def truncate_text_to_token_limit(text, token_limit=6000, model=gpt_model):
+    encoding = tiktoken.encoding_for_model(model)
+    tokens = encoding.encode(text)
+    truncated_tokens = tokens[:token_limit]
+    return encoding.decode(truncated_tokens)
+
+
+def generate_response(query, context, model=gpt_model, temp=0):
+    max_input_tokens = 6000
+    if count_tokens(context, model) > max_input_tokens:
+        context = truncate_text_to_token_limit(context, max_input_tokens, model)
+
+
+    system_prompt = (
+    "You are a helpful assistant. You must answer using only the provided context.\n"
+    "Do not use our own knowledge or external information.\n"
+    "If the context explicitly or implicitly supports answering the question, provide a concise and clear answer.\n"
+    "If the question has multiple parts, answer each part you can from the context.\n"
+    "Supported means the statement is clearly stated or can be logically inferred from the context.\n"
+    "Unsupported means the statement contradicts the context or cannot be found or inferred.\n"
+    "For any part not supported by the context, write: 'Not found in context.'\n"
+    "Only if no part is answerable at all, reply exactly: \"I don't know based on the provided context.\""
+    )
+
+
+    user_prompt = (
+        f"Context:\n{context}\n\n"
+        f"Question:\n{query}\n\n"
+        # "Answer:"
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    response = openai.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temp,
+        max_tokens=500
+    )
+    return response.choices[0].message.content.strip()
+
+# 3. Retrieval
+import numpy as np
+import faiss
+import torch # Import torch to use .cpu()
+
+# BM25 Retrieval
+def bm25_retrieval(bm25, query, corpus, top_k):
+    tokenized_query = word_tokenize(query.lower())
+    scores = bm25.get_scores(tokenized_query)
+    top_n = np.argsort(scores)[::-1][:top_k]
+    return [corpus[idx] for idx in top_n]
+
+
+def build_faiss_index(corpus_embeddings):
+    # Move embeddings to CPU before converting to numpy for FAISS
+    corpus_embeddings_np = corpus_embeddings.cpu().numpy()
+    index = faiss.IndexFlatL2(corpus_embeddings_np.shape[1])
+    index.add(corpus_embeddings_np)
+    return index
+
+# Then reuse
+def dpr_retrieval(dpr_model, query, faiss_index, corpus, top_k):
+    query_embedding = dpr_model.encode([query])
+    D, I = faiss_index.search(query_embedding, top_k)
+    return [corpus[idx] for idx in I[0]]
+
+
+def chunk_by_sentences(text, max_words):
+    sentences = sent_tokenize(text)
+    chunks = []
+    current_chunk = []
+
+    current_len = 0
+    for sentence in sentences:
+        word_count = len(sentence.split())
+        if current_len + word_count > max_words:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [sentence]
+            current_len = word_count
+        else:
+            current_chunk.append(sentence)
+            current_len += word_count
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    return chunks
+
+
+# Chunk a document into passages
+def chunk_document(doc, chunk_size=512, overlap=128):
+    sentences = sent_tokenize(doc)
+    chunks = []
+    current_chunk = ""
+    current_length = 0
+
+    for sentence in sentences:
+        sentence_length = len(sentence.split())
+        if current_length + sentence_length > chunk_size:
+            chunks.append(current_chunk.strip())
+            current_chunk = " ".join(current_chunk.split()[-overlap:])  # keep overlap
+            current_length = len(current_chunk.split())
+
+        current_chunk += " " + sentence
+        current_length += sentence_length
+
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+
+#---------------------------------------------------------------------------------#
+#--------------------------Hybrid Retrieval-2-------------------------------------#
+#---------------------------------------------------------------------------------#
+
+def hybrid_retrieval_sentences(bm25, dpr_model, query, corpus, corpus_embeddings, faiss_index, alpha, top_k):
+    tokenized_query = word_tokenize(query.lower())
+    query_embedding = dpr_model.encode([query])
+
+    bm25_scores = np.array(bm25.get_scores(tokenized_query))
+    D, _ = faiss_index.search(query_embedding, len(corpus))
+    dpr_scores = -D.flatten()  # Negative distance as similarity
+
+    # Optional: Normalize for stability
+    bm25_scores = (bm25_scores - np.mean(bm25_scores)) / (np.std(bm25_scores) + 1e-8)
+    dpr_scores = (dpr_scores - np.mean(dpr_scores)) / (np.std(dpr_scores) + 1e-8)
+
+    combined_scores = alpha * bm25_scores + (1-alpha) * dpr_scores
+    top_n = np.argsort(combined_scores)[::-1][:top_k]
+    hybrid_retrieved_text= [corpus[idx] for idx in top_n]
+    # filtered_sentences = filter_sentences_by_relevance(query, hybrid_retrieved_text)
+    return hybrid_retrieved_text
+
+
+
+
+def hybrid_retrieval_sentences2(tokenized_query, sentence_embeddings_bm25, query_embedding, faiss_index_sentences_dpr, sentence_chunks, alpha, top_k):
+    """
+    - tokenized_query: tokenized input query (for BM25)
+    - sentence_embeddings_bm25: BM25 object built on sentence_chunks
+    - query_embedding: query embedding (for FAISS)
+    - faiss_index_sentences_dpr: FAISS index built on DPR embeddings for sentence_chunks
+    - sentence_chunks: list of text chunks (must match what BM25 and DPR were built on!)
+    - alpha: hybridization parameter
+    - top_k: number of sentences to return
+    """
+    print(f"Inside `hybrid_retrieval_sentences2`")
+
+    n_chunks = len(sentence_chunks)
+
+    # BM25 scores
+    bm25_scores = np.array(sentence_embeddings_bm25.get_scores(tokenized_query))
+
+
+    # FAISS/DPR scores
+    D, _ = faiss_index_sentences_dpr.search(query_embedding, n_chunks)
+    dpr_scores = -D.flatten()  # Negative distance as similarity
+
+    bm25_scores = (bm25_scores - np.mean(bm25_scores)) / (np.std(bm25_scores) + 1e-8)
+
+    dpr_scores = (dpr_scores - np.mean(dpr_scores)) / (np.std(dpr_scores) + 1e-8)
+
+
+    # Assert to catch bugs
+    assert bm25_scores.shape == dpr_scores.shape == (n_chunks,), \
+        f"BM25 shape: {bm25_scores.shape}, DPR shape: {dpr_scores.shape}, n_chunks: {n_chunks}"
+
+    combined_scores = alpha * bm25_scores + (1 - alpha) * dpr_scores
+    top_n = np.argsort(combined_scores)[::-1][:top_k]
+
+
+    hybrid_retrieved_text = [sentence_chunks[idx] for idx in top_n]
+
+    query=" ".join(tokenized_query)
+    return hybrid_retrieved_text
+
+# 4. Performance Measurements
+import tiktoken
+import spacy
+from nltk.tokenize import sent_tokenize
+import json
+import re
+
+
+nlp=spacy.load("en_core_web_sm")
+
+# Token counting function
+def truncate_text_by_tokens(text, model=gpt_model, max_tokens=70000):
+    encoding = tiktoken.encoding_for_model(model)
+    tokens = encoding.encode(text)
+    if len(tokens) > max_tokens:
+        tokens = tokens[:max_tokens]
+    return encoding.decode(tokens)
+
+
+# Add near our imports
+import re
+from nltk.tokenize import sent_tokenize
+
+
+import re
+import json
+from nltk.tokenize import sent_tokenize
+
+def _split_and_index_context(context: str, max_total_tokens=7000):
+    """
+    Split context into sentences, apply light cleanup, and add [S#] IDs.
+    Returns (indexed_context_str, sentences_list) where sentences_list[i] is the raw sentence for S{i+1}.
+    """
+    # (keep our truncation if needed, or call truncate_text_by_tokens here)
+    ctx = context.replace("\n\n", " ").replace("\n", " ").strip()
+    sents = [s.strip() for s in sent_tokenize(ctx) if s.strip() and re.search(r"[A-Za-z]", s)]
+    indexed_lines = [f"[S{i+1}] {s}" for i, s in enumerate(sents)]
+    return "\n".join(indexed_lines), sents
+
+# ---- PROMPT: ask for IDs only ----
+context_rel_prompt_ids = PromptTemplate(
+    input_variables=["question", "indexed_context"],
+    template=(
+        "You must assess how completely the provided CONTEXT covers the QUESTION.\n"
+        "Work in four steps:\n"
+        "1) Split the QUESTION into the smallest number of atomic sub-questions needed to fully answer it.\n"
+        "2) For each sub-question, decide if the CONTEXT contains explicit evidence that answers it.\n"
+        "   - Mark supported=true only if the answer is explicitly stated in the CONTEXT.\n"
+        "   - Do NOT use outside knowledge.\n"
+        "3) For supported sub-questions, cite the evidence by returning the CONTEXT sentence IDs (e.g., S3, S7) only.\n"
+        "   - IMPORTANT: Return IDs only, exactly as shown, no text.\n\n"
+        "Return STRICT JSON with this schema and nothing else:\n"
+        "{{\n"
+        "  \"sub_questions\": [\n"
+        "    {{\"q\": \"<sub-question 1>\", \"supported\": true|false, \"evidence_ids\": [\"S1\", \"S7\", ...]}},\n"
+        "    ...\n"
+        "  ]\n"
+        "}}\n\n"
+        "QUESTION:\n{question}\n\n"
+        "CONTEXT (each sentence has an ID in brackets):\n{indexed_context}\n"
+    )
+)
+
+context_chain_ids = LLMChain(llm=llm, prompt=context_rel_prompt_ids)
+
+def _extract_json_block(text: str) -> str:
+    text = text.strip()
+    if text.startswith("{") and text.endswith("}"):
+        return text
+    m = re.search(r"\{.*\}", text, flags=re.S)
+    return m.group(0) if m else "{}"
+
+def evaluate_context_relevance(question: str, context: str, max_total_tokens=7000) -> float:
+    """
+    RAGAS-aligned Context Relevance:
+      CR = (# unique context sentence IDs selected as evidence) / (total # context sentences)
+    """
+    print("\nInside evaluate_context_relevance (ID-based)")
+
+    indexed_context, ctx_sents = _split_and_index_context(context, max_total_tokens=max_total_tokens)
+
+    total_sentences = len(ctx_sents)
+
+    if total_sentences == 0:
+        return 0.0
+
+    # 2) Ask the LLM to return ONLY sentence IDs as evidence
+    raw = context_chain_ids.invoke({"question": question, "indexed_context": indexed_context})
+    raw_text = (raw["text"] if isinstance(raw, dict) and "text" in raw else str(raw)).strip()
+    # print("LLM JSON Raw (first 1000 chars):", raw_text[:1000])
+
+    try:
+        payload = json.loads(_extract_json_block(raw_text))
+    except Exception as e:
+        print(f"[warn] JSON parse failed: {e}")
+        payload = {"sub_questions": []}
+
+    subqs = payload.get("sub_questions", [])
+    # print("Parsed sub_questions:", subqs)
+
+    # 3) Collect unique evidence IDs (for supported sub-questions only)
+    selected_ids = set()
+    for item in subqs:
+        if isinstance(item, dict) and item.get("supported") is True:
+            ids = item.get("evidence_ids", [])
+            if isinstance(ids, str):
+                ids = [ids]
+            for sid in ids:
+                if isinstance(sid, str) and re.fullmatch(r"S\d+", sid.strip()):
+                    # Make sure ID is in range
+                    try:
+                        idx = int(sid[1:])  # 'S12' -> 12
+                        if 1 <= idx <= total_sentences:
+                            selected_ids.add(idx)  # store as int index
+                    except Exception:
+                        pass
+
+    num_extracted = len(selected_ids)
+    cr = num_extracted / total_sentences
+    return max(0.0, min(1.0, cr))
+
+
+#---------------------------------------------------------------------------------------------------------------------
+#2. FAITHFULNESS Score
+#-----------------------------------------------------------------------------------------------#
+#-------------------New definition of Faithfulness as 08/11/2025------------#
+#-----------------------------------------------------------------------------------------------#
+
+# --- New helpers (keep near our imports) ---
+import json
+import re
+from nltk.tokenize import sent_tokenize
+
+def _normalize_space(s: str) -> str:
+    return " ".join(s.split())
+
+def _split_and_index_context(context: str, max_total_tokens=7000):
+    """
+    Returns:
+      indexed_context: one string where each sentence is prefixed with [S#]
+      ctx_sents: list of raw sentences
+    """
+    # (Optional) apply our truncate_text_by_tokens if desired here
+    # context = truncate_text_by_tokens(context, max_total_tokens)
+    ctx_sents = [s.strip() for s in sent_tokenize(context) if s.strip() and re.search(r"[A-Za-z]", s)]
+    indexed_lines = []
+    for i, s in enumerate(ctx_sents, start=1):
+        indexed_lines.append(f"[S{i}] {s}")
+    indexed_context = "\n".join(indexed_lines)
+    return indexed_context, ctx_sents
+
+def _extract_json_block(text: str) -> str:
+    text = text.strip()
+    if text.startswith("{") and text.endswith("}"):
+        return text
+    m = re.search(r"\{.*\}", text, flags=re.S)
+    return m.group(0) if m else "{}"
+
+# NEW: sub-question decomposition (very lightweight)
+q_decompose_prompt = PromptTemplate(
+    input_variables=["question"],
+    template=(
+        "Split the QUESTION into the smallest number of atomic sub-questions needed to fully answer it.\n"
+        "Return STRICT JSON like: {{\"sub_questions\": [\"...\", \"...\"]}}\n\n"
+        "QUESTION:\n{question}"
+    )
+)
+q_decompose_chain = LLMChain(llm=llm, prompt=q_decompose_prompt)
+
+statement_extract_prompt = PromptTemplate(
+    input_variables=["question", "answer"],
+    template=(
+        "Given a question and answer, identify the main factual statements made in the answer. "
+        "Break down compound sentences into simpler factual claims when it makes sense, but do not over-split. "
+        "Include important details like location, event, or time if they are essential to the meaning.\n\n"
+        "Do NOT include meta statements like 'the answer does not provide...' or 'information is missing'. Only include factual claims actually made in the answer.\n\n"
+        "Return the statements as a numbered list.\n\n"
+        "Question: {question}\nAnswer: {answer}\n\nStatements:\n1."
+    )
+)
+
+
+statement_chain = LLMChain(llm=llm, prompt=statement_extract_prompt)
+
+# NEW: map [A#] -> sub-question id
+
+map_stmt_to_subq_prompt = PromptTemplate(
+    input_variables=["sub_questions_json", "statements_indexed"],
+    template=(
+        "You are given sub-questions and indexed answer statements.\n"
+        "Assign each answer statement to the single most relevant sub-question (by index).\n"
+        "Return STRICT JSON as:\n"
+        "{{\n"
+        "  \"assignments\": [\n"
+        "    {{\"a_idx\": 1, \"subq_idx\": 1}},\n"
+        "    {{\"a_idx\": 2, \"subq_idx\": 1}},\n"
+        "    {{\"a_idx\": 3, \"subq_idx\": 2}}\n"
+        "  ]\n"
+        "}}\n\n"
+        "Sub-questions JSON:\n{sub_questions_json}\n\n"
+        "Indexed Answer Statements:\n{statements_indexed}"
+    )
+)
+map_chain = LLMChain(llm=llm, prompt=map_stmt_to_subq_prompt)
+
+
+
+verification_prompt = PromptTemplate(
+    input_variables=["context", "statements_list"],
+    template=(
+        "You are given a context and a list of factual statements. "
+        "For each statement, decide whether it is supported by the context.\n\n"
+        "Supported means the statement is clearly stated or can be logically inferred from the context.\n"
+        "Unsupported means the statement contradicts the context or cannot be found or inferred.\n\n"
+        "Respond with a numbered list of 'Yes' or 'No' only.\n\n"
+        "Context:\n{context}\n\n"
+        "Statements:\n{statements_list}\n\n"
+        "Final Verdicts:\n1."
+    )
+)
+
+verification_chain = LLMChain(llm=llm, prompt=verification_prompt)
+
+# NEW: verification that returns JSON with support + evidence indices/text
+verification_json_prompt = PromptTemplate(
+    input_variables=["indexed_context", "statements_indexed"],
+    template=(
+        "CONTEXT with indexed sentences:\n{indexed_context}\n\n"
+        "STATEMENTS (indexed as [A#]):\n{statements_indexed}\n\n"
+        "For each statement [A#], determine if it is supported by the CONTEXT.\n"
+        "- supported=true only if the claim is explicitly stated or logically entailed by sentences in CONTEXT.\n"
+        "- If supported=true, include the exact evidence sentences from CONTEXT as both their [S#] ids and verbatim text.\n"
+        "Return STRICT JSON ONLY:\n"
+        "{{\n"
+        "  \"results\": [\n"
+        "    {{\"a_idx\": 1, \"supported\": true,  \"evidence_ids\": [\"S4\"], \"evidence_text\": [\"<verbatim>\"]}},\n"
+        "    {{\"a_idx\": 2, \"supported\": false, \"evidence_ids\": [],      \"evidence_text\": []}}\n"
+        "  ]\n"
+        "}}\n"
+    )
+)
+verification_json_chain = LLMChain(llm=llm, prompt=verification_json_prompt)
+
+
+def evaluate_faithfulness(question: str, answer: str, context: str, max_total_tokens=7000) -> float:
+    """
+    Faithfulness aligned to RAGAS:
+      1) Answer statements are indexed [A#].
+      2) For each supported statement, we capture verbatim context evidence with [S#] ids.
+      3) Score is computed per sub-question (mean support of its assigned statements) and
+         the final score is the average across sub-questions (equal weight).
+      Fallback: if mapping fails, fall back to global |V|/|S|.
+    """
+    print("\nInside evaluate_faithfulness")
+
+    # Guardrail: short-circuit on "I don't know..." etc.
+    fallback_phrases = {
+        "i don't know based on the provided context",
+        "context does not contain enough information",
+        "cannot answer based on provided context",
+        "not found in context",
+    }
+    answer_clean = answer.strip().lower().rstrip(".!?")
+    if answer_clean in fallback_phrases:
+        return 0.0
+
+    # ---- 0) Decompose the QUESTION into sub-questions ----
+    try:
+        subq_raw = q_decompose_chain.run({"question": question}).strip()
+        subq_json = json.loads(_extract_json_block(subq_raw))
+        sub_questions = subq_json.get("sub_questions", [])
+    except Exception as e:
+        print(f"[warn] sub-question parse failed: {e}")
+        sub_questions = []
+
+    # Minimal safety
+    if not isinstance(sub_questions, list):
+        sub_questions = []
+    sub_questions = [s for s in sub_questions if isinstance(s, str) and s.strip()]
+    # print("SUB-QUESTIONS:", sub_questions)
+
+    # ---- 1) Extract answer statements ----
+    answer_statements_text = statement_chain.run({"question": question, "answer": answer}).strip()
+    if not answer_statements_text:
+        return 0.0
+
+    answer_statements = []
+    for line in answer_statements_text.splitlines():
+        line = line.strip()
+        line = re.sub(r'^[\d]+\s*[\.\)]\s*', '', line)  # strip "1. ", "2)", etc
+        if line:
+            answer_statements.append(line)
+
+    META_PAT = re.compile(r"\b(does not provide|not provided|unknown|insufficient|cannot answer|no information)\b", re.I)
+    answer_statements = [s for s in answer_statements if not META_PAT.search(s)]
+
+    # dedup while preserving order
+    answer_statements = list(dict.fromkeys(answer_statements))
+    if not answer_statements:
+        return 0.0
+
+    # index statements as [A#]
+    indexed_statements_lines = [f"[A{i}] {s}" for i, s in enumerate(answer_statements, start=1)]
+    statements_indexed_block = "\n".join(indexed_statements_lines)
+    # print("Indexed Answer Statements:", statements_indexed_block)
+
+    # ---- 2) Index the CONTEXT into [S#] lines (keep our truncation if needed) ----
+    # Optional: context = truncate_text_by_tokens(context, max_total_tokens)
+    indexed_context, ctx_sents = _split_and_index_context(context, max_total_tokens=max_total_tokens)
+
+    # ---- 3) Map answer statements to sub-questions (if any exist) ----
+    assignments = []
+    if sub_questions:
+        try:
+            subq_payload = {"sub_questions": sub_questions}
+            map_raw = map_chain.run({
+                "sub_questions_json": json.dumps(subq_payload, ensure_ascii=False),
+                "statements_indexed": statements_indexed_block
+            }).strip()
+            map_json = json.loads(_extract_json_block(map_raw))
+            assignments = map_json.get("assignments", [])
+        except Exception as e:
+            print(f"[warn] mapping parse failed: {e}")
+            assignments = []
+    # print("Mapping:", assignments)
+
+    # Build: A# -> subq_idx (1-based), default None
+    a_to_subq = {}
+    for item in assignments:
+        try:
+            aidx = int(item.get("a_idx"))
+            sidx = int(item.get("subq_idx"))
+            if aidx >= 1 and sidx >= 1 and sidx <= max(1, len(sub_questions)):
+                a_to_subq[aidx] = sidx
+        except Exception:
+            continue
+    # print("A# -> subq_idx:", a_to_subq)
+
+    # ---- 4) Verify support + collect evidence with [S#] ----
+    v_raw = verification_json_chain.run({
+        "indexed_context": indexed_context,
+        "statements_indexed": statements_indexed_block
+    }).strip()
+
+    try:
+        v_json = json.loads(_extract_json_block(v_raw))
+        results = v_json.get("results", [])
+    except Exception as e:
+        print(f"[warn] verification JSON parse failed: {e}")
+        results = []
+    # print("Verification results:", results)
+
+    # Normalize results to dict: A# -> supported(bool)
+    a_supported = {}      # int -> bool
+    a_evidence_ids = {}   # int -> list of "S#"
+    a_evidence_text = {}  # int -> list of str
+    for r in results:
+        try:
+            aidx = int(r.get("a_idx"))
+        except Exception:
+            continue
+        a_supported[aidx] = bool(r.get("supported", False))
+        ev_ids = r.get("evidence_ids", []) or []
+        ev_txt = r.get("evidence_text", []) or []
+        # normalize types
+        ev_ids = [str(e).strip() for e in ev_ids if str(e).strip()]
+        ev_txt = [str(e).strip() for e in ev_txt if str(e).strip()]
+        a_evidence_ids[aidx] = ev_ids
+        a_evidence_text[aidx] = ev_txt
+
+    # ---- 5) Compute per-sub-question scores, then average ----
+    if sub_questions and any(a_to_subq.values()):
+        # group A# by subq
+        subq_to_aidx = {}
+        for aidx in range(1, len(answer_statements) + 1):
+            sidx = a_to_subq.get(aidx)  # may be None
+            if sidx is None:
+                continue
+            subq_to_aidx.setdefault(sidx, []).append(aidx)
+
+        per_subq_scores = []
+        for sidx in range(1, len(sub_questions) + 1):
+            a_list = subq_to_aidx.get(sidx, [])
+            if not a_list:
+                # no statements mapped → define as 0 coverage for that sub-question
+                per_subq_scores.append(0.0)
+            else:
+                yes_cnt = sum(1 for aidx in a_list if a_supported.get(aidx, False))
+                per_subq_scores.append(yes_cnt / len(a_list))
+        # print("Per-subq scores:", per_subq_scores)
+
+        final_score = sum(per_subq_scores) / len(per_subq_scores)
+    else:
+        # Fallback: global |V|/|S|
+        print("Fallback Fallback: global |V|/|S|")
+        yes_cnt = sum(1 for aidx in range(1, len(answer_statements) + 1) if a_supported.get(aidx, False))
+        final_score = yes_cnt / len(answer_statements)
+
+
+
+    return max(0.0, min(1.0, float(final_score)))
+
+
+
+#---------------------------------------------------------------------------------------------------------------------
+#---------------------------------------3. Answer Relvance Score -----------------------------------------------------
+#---------------------------------------------------------------------------------------------------------------------
+from langchain.embeddings import OpenAIEmbeddings
+import numpy as np
+from langchain.embeddings import SentenceTransformerEmbeddings
+from sentence_transformers import SentenceTransformer, util
+
+
+# Prompt to generate question(s) from the answer
+qgen_prompt = PromptTemplate(
+    input_variables=["answer"],
+    template= (
+        "Generate three plausible questions that the following answer could be responding to. "
+        "If the answer is very short or incomplete, you may generate a single question.\n\n"
+        "Answer: {answer}\n\nQuestions:"
+    )
+)
+
+        # "Generate one or more plausible questions that the following answer could be responding to. "
+
+qgen_chain = LLMChain(llm=ChatOpenAI(model_name=gpt_model, temperature=0.3), prompt=qgen_prompt)
+
+embedding_model = SentenceTransformer("BAAI/bge-large-en-v1.5")
+
+
+def evaluate_answer_relevance(question: str, answer: str) -> float:
+    """Evaluate answer relevance as the semantic similarity between the question and the question(s) implied by the answer."""
+    # Use LLM to generate possible question(s) that the answer corresponds to
+    print(f"\nInside evaluate_answer_relevance")
+
+    fallback_phrases = [
+        "i don't know based on the provided context",
+        "context does not contain enough information",
+        "cannot answer based on provided context",
+        "not found in context"
+    ]
+
+    answer_clean = answer.strip().lower().rstrip('.!?')
+    # print(f"answer_clean:", answer_clean)
+
+    if answer_clean in fallback_phrases:
+        return 0.0
+
+    generated = qgen_chain.run({"answer": answer}).strip()
+    # print(f"1.generated_questions:", generated)
+
+    if not generated:
+        return 0.0
+    # Split the LLM output into individual questions (assuming separated by newlines or semicolons)
+    # Remove any numbering or bullet points if present.
+    candidate_questions = []
+    for line in generated.splitlines():
+        # filter out empty lines or non-question text
+        line = line.strip().lstrip(" -0123456789.).")  # remove common list prefixes
+        if line:
+            # Ensure it ends with a question mark; if not, assume it's a single question in one line
+            if line.endswith("?"):
+                candidate_questions.append(line)
+            else:
+                # If the model returned a single question without a '?', treat the whole line as one question
+                candidate_questions.append(line)
+    if not candidate_questions:
+        candidate_questions = [generated]  # use the whole output as one question if splitting failed
+
+    # print(f"2.candidate_questions:", candidate_questions)
+
+    # Get the single embedding vector for the question
+    q_emb = np.array(openai_embed(question)[0])
+
+    # Get the single embedding vector for each candidate question
+    cand_embs = [np.array(openai_embed(q)[0]) for q in candidate_questions]
+
+
+    # Compute cosine similarities
+    sims = []
+
+    for emb in cand_embs:
+        # cosine similarity = (u·v) / (||u||*||v||)
+        # Check for zero vectors before calculating norm and dot product
+        if np.linalg.norm(q_emb) == 0 or np.linalg.norm(emb) == 0:
+             sim = 0.0 # Or handle as appropriate for zero vectors
+        else:
+             sim = np.dot(q_emb, emb) / (np.linalg.norm(q_emb) * np.linalg.norm(emb))
+        sims.append(sim)
+
+    # print(f"3.sims:", sims)
+
+    # Average similarity across all generated questions
+    if len(sims) == 0:
+        return 0.0
+    score = float(np.mean(sims))
+    return score
+    
+# 5. (DO NOT RUN Everytime. Only for Creating Necessary Embedding with GPU
+
+# --- 1. IMPORTS ---
+import pandas as pd
+import pickle
+from sentence_transformers import SentenceTransformer
+from nltk.tokenize import word_tokenize
+
+
+# --- 2. CONFIG ---
+# TRAINING_DATA_PATH = "/content/drive/MyDrive/RAGAS_Dataset/RAGAS_augmented_dataset_2.xlsx"
+TESTING_DATA_PATH = "/content/drive/MyDrive/RAGAS_Dataset/RAGAS_dataset_for_the_research.xlsx"
+# PRECOMPUTED_TRAIN = "/content/drive/MyDrive/RAGAS_Dataset/precomputed_train3.pkl"
+PRECOMPUTED_TEST = "/content/drive/MyDrive/RAGAS_Dataset/precomputed_test4.pkl"
+
+
+possible_actions = [
+    (0.3, 1, 50), (0.3, 1, 100), (0.3, 1, 150),
+    (0.3, 3, 50), (0.3, 3, 100), (0.3, 3, 150),
+    (0.3, 5, 50), (0.3, 5, 100), (0.3, 5, 150),
+
+    (0.5, 1, 50), (0.5, 1, 100), (0.5, 1, 150),
+    (0.5, 3, 50), (0.5, 3, 100), (0.5, 3, 150),
+    (0.5, 5, 50), (0.5, 5, 100), (0.5, 5, 150),
+
+    (0.7, 1, 50), (0.7, 1, 100), (0.7, 1, 150),
+    (0.7, 3, 50), (0.7, 3, 100), (0.7, 3, 150),
+    (0.7, 5, 50), (0.7, 5, 100), (0.7, 5, 150)
+]
+
+unique_chunk_sizes = sorted(list(set([a[2] for a in possible_actions])))
+
+# --- 3. MODEL SETUP ---
+import torch
+dpr_model = SentenceTransformer('facebook-dpr-ctx_encoder-single-nq-base')
+if torch.cuda.is_available():
+    dpr_model = dpr_model.to('cuda')
+
+
+# --- 4. FUNCTION TO PRECOMPUTE FEATURES ---
+def precompute_features(df):
+    # Prepare columns
+    df["sentence_chunks_dict"] = None
+    df["sentence_embeddings_dpr_dict"] = None
+    df["sentence_embeddings_bm25_dict"] = None
+    df["faiss_index_sentences_dpr_dict"] = None
+    df["query_embedding"] = None
+    df["tokenized_query"] = None
+
+    for idx, row in df.iterrows():
+        document = row["source_content"]
+        query = row["question"]
+
+        # Query-level features
+        df.at[idx, "query_embedding"] = dpr_model.encode([query], convert_to_tensor=True)[0].cpu()
+        # df.at[idx, "query_embedding"] = bge_model.encode([query], convert_to_tensor=True)[0].cpu() #<== for precomputed_test4.pkl
+        df.at[idx, "tokenized_query"] = word_tokenize(query.lower())
+
+        # Dicts by chunk_size
+        sentence_chunks_dict = {}
+        sentence_embeddings_dpr_dict = {}
+        sentence_embeddings_bm25_dict = {}
+        faiss_index_sentences_dpr_dict = {}
+
+        for chunk_size in unique_chunk_sizes:
+            sentence_chunks = chunk_by_sentences(document, chunk_size)
+            sentence_chunks_dict[chunk_size] = sentence_chunks
+
+            # DPR embeddings (on GPU, then move to CPU for storage)
+            sentence_embeddings_dpr = dpr_model.encode(
+                sentence_chunks, convert_to_tensor=True, batch_size=64
+            ).cpu()
+            sentence_embeddings_dpr_dict[chunk_size] = sentence_embeddings_dpr
+
+            # BM25 and Faiss
+            sentence_embeddings_bm25 = bm25_embedding(sentence_chunks, 0.5, 0)
+            sentence_embeddings_bm25_dict[chunk_size] = sentence_embeddings_bm25
+
+            faiss_idx_dpr = build_faiss_index(sentence_embeddings_dpr)
+            faiss_index_sentences_dpr_dict[chunk_size] = faiss_idx_dpr
+
+        # Store all dicts
+        df.at[idx, "sentence_chunks_dict"] = sentence_chunks_dict
+        df.at[idx, "sentence_embeddings_dpr_dict"] = sentence_embeddings_dpr_dict
+        df.at[idx, "sentence_embeddings_bm25_dict"] = sentence_embeddings_bm25_dict
+        df.at[idx, "faiss_index_sentences_dpr_dict"] = faiss_index_sentences_dpr_dict
+
+    return df
+
+# --- 5. RUN FOR BOTH DATASETS AND SAVE ---
+for path, save_path in [
+    # (TRAINING_DATA_PATH, PRECOMPUTED_TRAIN),
+    (TESTING_DATA_PATH, PRECOMPUTED_TEST)
+]:
+    print(f"\nProcessing: {path}")
+    df = pd.read_excel(path)
+    df_out = precompute_features(df)
+    with open(save_path, "wb") as f:
+        pickle.dump(df_out, f)
+    print(f"Saved to {save_path}")
+
+
+# 6. Create Full Test dataset with All Possible Actions
+
+# full sample check
+import pickle
+import pandas as pd
+import numpy as np
+import os
+
+import numpy as np
+import torch
+from ragas import evaluate
+from ragas.metrics import faithfulness, answer_relevancy, context_recall, context_precision
+from datasets import Dataset
+
+possible_actions = [
+    (0.3, 1, 50), (0.3, 1, 100), (0.3, 1, 150),
+    (0.3, 3, 50), (0.3, 3, 100), (0.3, 3, 150),
+    (0.3, 5, 50), (0.3, 5, 100), (0.3, 5, 150),
+
+    (0.5, 1, 50), (0.5, 1, 100), (0.5, 1, 150),
+    (0.5, 3, 50), (0.5, 3, 100), (0.5, 3, 150),
+    (0.5, 5, 50), (0.5, 5, 100), (0.5, 5, 150),
+
+    (0.7, 1, 50), (0.7, 1, 100), (0.7, 1, 150),
+    (0.7, 3, 50), (0.7, 3, 100), (0.7, 3, 150),
+    (0.7, 5, 50), (0.7, 5, 100), (0.7, 5, 150)
+]
+
+# PRECOMPUTED_TEST = "/content/drive/MyDrive/RAGAS_Dataset/precomputed_test2.pkl"
+PRECOMPUTED_TEST = "/content/drive/MyDrive/RAGAS_Dataset/precomputed_test4.pkl"
+
+
+# Load precomputed DataFrames
+with open(PRECOMPUTED_TEST, "rb") as f:
+    df_test= pickle.load(f)
+
+
+# --- Setup ---
+log_rows = []
+output_csv = "/content/drive/MyDrive/RAGAS_Dataset/action_exploration_precomputed_test3_log_20250828.csv"  # Change path as needed
+
+for idx, row in df_test.iterrows():    # <--- Use our test df!
+    query = row['question']
+    source = row.get('source', '')
+    for action_idx, action_tuple in enumerate(possible_actions):
+        print(f"Processing row {idx}, action {action_idx}")
+        print(f"Action Tuple: {action_tuple}")
+        try:
+            alpha, top_k, chunk_size = action_tuple
+
+            sentence_chunks = row["sentence_chunks_dict"][chunk_size]
+            sentence_embeddings_dpr = row["sentence_embeddings_dpr_dict"][chunk_size]
+            sentence_embeddings_bm25 = row["sentence_embeddings_bm25_dict"][chunk_size]
+            faiss_index_sentences_dpr = row["faiss_index_sentences_dpr_dict"][chunk_size]
+            query_embedding = row["query_embedding"]
+            tokenized_query = row["tokenized_query"]
+
+            if isinstance(query_embedding, torch.Tensor):
+                query_embedding = query_embedding.cpu().numpy()
+            if len(query_embedding.shape) == 1:
+                query_embedding = np.expand_dims(query_embedding, axis=0)
+
+            filtered_context = hybrid_retrieval_sentences2(
+                tokenized_query, sentence_embeddings_bm25, query_embedding,
+                faiss_index_sentences_dpr, sentence_chunks, alpha, top_k
+            )
+            context_text = " ".join(filtered_context)
+            generated_answer = generate_response(query, context_text)
+            faith = evaluate_faithfulness(query, generated_answer, context_text)
+            ans_rel = evaluate_answer_relevance(query, generated_answer)
+            ctx_rel = evaluate_context_relevance(query, context_text)
+            print(f"faith:{faith:.4f}, ans_rel:{ans_rel:.4f}, ctx_rel:{ctx_rel:.4f}")
+            reward_1 = (faith + ans_rel + ctx_rel) / 3
+
+            log_rows.append({
+                "row_idx": idx,
+                "source": source,
+                "query": query,
+                "action_idx": action_idx,
+                "action_tuple": action_tuple,
+                "context_text": context_text,
+                "generated_answer": generated_answer,
+                "faithfulness": faith,
+                "answer_relevance": ans_rel,
+                "context_relevance": ctx_rel,
+                "reward_1": reward_1,
+                # "reward_2": reward_2,
+                # "ragas_result": result,
+            })
+        except Exception as e:
+            print(f"Error with row {idx}, action {action_idx}: {e}")
+            continue
+
+# --- Convert to DataFrame and Save ---
+log_df = pd.DataFrame(log_rows)
+log_df.to_csv(output_csv, index=False)
+print(f"Full action evaluation log saved to {output_csv}")
+print("Sample output:")
+display(log_df.head(5))
+
+
+
+# 7. Create a custom Gym environment
+
+# --- Imports & Model Classes ---
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import SGDRegressor
+from sklearn.preprocessing import StandardScaler
+from collections import defaultdict
+from torch.utils.tensorboard import SummaryWriter
+import random
+import time
+# from contextualbandits.online import EpsilonGreedy
+from sklearn.ensemble import RandomForestRegressor
+
+bge_model = SentenceTransformer("BAAI/bge-large-en-v1.5") # Moved definition here
+
+def embed(text):
+    """
+    Returns embedding as a NumPy array on CPU,
+    even if embedding model runs on GPU.
+    """
+    with torch.no_grad():
+        emb = bge_model.encode(text, convert_to_tensor=True)  # PyTorch tensor on GPU/CPU
+    return emb.detach().cpu().numpy()
+
+GLOBAL_STEP_COUNTER = 0
+
+# === Modular Contextual Bandit Classes ===
+
+class BaseBanditModel:
+    def __init__(self, n_actions, context_dim):
+        self.n_actions = n_actions
+        self.context_dim = context_dim
+
+    def predict(self, context):
+        raise NotImplementedError
+
+    def update(self, action, context, reward):
+        raise NotImplementedError
+
+class LinearBanditModel(BaseBanditModel):
+    def __init__(self, n_actions, context_dim):
+        super().__init__(n_actions, context_dim)
+        self.models = [SGDRegressor(max_iter=1, learning_rate='constant', eta0=0.01, tol=None) for _ in range(n_actions)]
+        self.scalers = [StandardScaler() for _ in range(n_actions)]
+        self.initialized = [False] * n_actions
+
+    def predict(self, context):
+        preds = []
+        for i in range(self.n_actions):
+            x = context.reshape(1, -1)
+            if not self.initialized[i]:
+                preds.append(0.0)  # Cold start
+            else:
+                x_scaled = self.scalers[i].transform(x)
+                preds.append(self.models[i].predict(x_scaled)[0])
+        return np.array(preds)
+
+    def update(self, action, context, reward):
+        x = context.reshape(1, -1)
+        y = np.array([reward])
+        if not self.initialized[action]:
+            self.scalers[action].fit(x)
+            x_scaled = self.scalers[action].transform(x)
+            self.models[action].partial_fit(x_scaled, y)
+            self.initialized[action] = True
+        else:
+            x_scaled = self.scalers[action].transform(x)
+            self.models[action].partial_fit(x_scaled, y)
+
+def get_bandit_model(model_type: str, n_actions: int, context_dim: int):
+    if model_type == "linear":
+        return LinearBanditModel(n_actions, context_dim)
+    else:
+        raise NotImplementedError(f"Model type '{model_type}' is not implemented yet.")
+
+# === our RAG pipeline helper ===
+def get_context_vector(query, document, embed):  # adapt as needed
+    # e.g., concatenate BGE embeddings of query and document
+    return np.concatenate([embed(query), embed(document)], axis=0)
+
+
+# === TensorBoard logger ===
+writer = SummaryWriter("/content/drive/MyDrive/Stable_Baseline3/cb_tensorboard")
+
+# 8. Some Basic Setup for Contexual Bandit
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+import random
+import os
+from collections import deque
+from sklearn.model_selection import train_test_split
+from datetime import datetime
+from sentence_transformers import SentenceTransformer
+from collections import defaultdict
+import pickle
+
+PRECOMPUTED_TRAIN = "/content/drive/MyDrive/RAGAS_Dataset/precomputed_train2.pkl"
+PRECOMPUTED_TEST = "/content/drive/MyDrive/RAGAS_Dataset/precomputed_test4.pkl"
+
+# Load precomputed DataFrames
+with open(PRECOMPUTED_TRAIN, "rb") as f:
+    df_train = pickle.load(f)
+with open(PRECOMPUTED_TEST, "rb") as f:
+    df_test= pickle.load(f)
+
+test_df=df_test
+
+train_df=df_train
+
+print(f"Training set size: {len(train_df)}")
+
+
+possible_actions = [
+    (0.3, 1, 50), (0.3, 1, 100), (0.3, 1, 150),
+    (0.3, 3, 50), (0.3, 3, 100), (0.3, 3, 150),
+    (0.3, 5, 50), (0.3, 5, 100), (0.3, 5, 150),
+
+    (0.5, 1, 50), (0.5, 1, 100), (0.5, 1, 150),
+    (0.5, 3, 50), (0.5, 3, 100), (0.5, 3, 150),
+    (0.5, 5, 50), (0.5, 5, 100), (0.5, 5, 150),
+
+    (0.7, 1, 50), (0.7, 1, 100), (0.7, 1, 150),
+    (0.7, 3, 50), (0.7, 3, 100), (0.7, 3, 150),
+    (0.7, 5, 50), (0.7, 5, 100), (0.7, 5, 150)
+]
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+bge_model = SentenceTransformer("BAAI/bge-large-en-v1.5") # Moved definition here
+
+
+import os
+import pickle
+import pandas as pd
+
+
+
+# ====== Run Id ====
+
+run_id = "contextual_bandit_EG_20250812_1"  # <-- make sure this matches our run
+
+# === Paths ===
+base_dir = "/content/drive/MyDrive/ContextualBandit_EG_Experiments_"
+
+checkpoint_dir = os.path.join(base_dir, f"checkpoints_{run_id}")
+# checkpoint_file = os.path.join(checkpoint_dir, f"checkpoint.pkl") #<==== Original Checkpoint
+
+checkpoint_file = os.path.join(checkpoint_dir, f"checkpoint_deduped_20250903_030810.pkl") #<==== Deduped Checkpoint
+
+# === Load checkpoint ===
+if not os.path.exists(checkpoint_file):
+    raise FileNotFoundError(f"Checkpoint file not found at: {checkpoint_file}")
+
+with open(checkpoint_file, "rb") as f:
+    checkpoint = pickle.load(f)
+
+# train_df=checkpoint
+
+# === Extract training log ===
+if "train_log" not in checkpoint:
+    raise KeyError("train_log not found in checkpoint file.")
+
+train_log_df = pd.DataFrame(checkpoint["train_log"])
+print(f"Loaded training log with shape: {train_log_df.shape}")
+print(train_log_df.columns)
+print(f"train_log_df shape:",train_log_df.shape)
+
+start_idx = 0
+
+
+contexts = np.stack(checkpoint['contexts'][start_idx:])   # shape: (n_steps, context_dim)
+actions = np.array(checkpoint['actions'][start_idx:])     # shape: (n_steps,)
+rewards = np.array(checkpoint['rewards'][start_idx:])     # shape: (n_steps,)
+# rewards = np.array(train_log_df['context_relevance'][start_idx:end_idx], dtype=np.float32)     # shape: (n_steps,)
+
+context_dim  = contexts.shape[1]
+print(f"context_dim: {context_dim}")
+
+# actual_rewards_dim  = actual_rewards.shape[0]
+# print(f"actual_rewards_dim: {actual_rewards_dim}")
+
+rewards_dim  = rewards.shape[0]
+print(f"rewards_dim: {rewards_dim}")
+
+# possible_actions must be defined as in our training script
+possible_actions = [
+    (0.3, 1, 50), (0.3, 1, 100), (0.3, 1, 150),
+    (0.3, 3, 50), (0.3, 3, 100), (0.3, 3, 150),
+    (0.3, 5, 50), (0.3, 5, 100), (0.3, 5, 150),
+
+    (0.5, 1, 50), (0.5, 1, 100), (0.5, 1, 150),
+    (0.5, 3, 50), (0.5, 3, 100), (0.5, 3, 150),
+    (0.5, 5, 50), (0.5, 5, 100), (0.5, 5, 150),
+
+    (0.7, 1, 50), (0.7, 1, 100), (0.7, 1, 150),
+    (0.7, 3, 50), (0.7, 3, 100), (0.7, 3, 150),
+    (0.7, 5, 50), (0.7, 5, 100), (0.7, 5, 150)
+]
+
+n_actions = len(possible_actions)
+print(f"n_actions: {n_actions}")
+
+# 10. Reload Testing data for Model Building
+import os
+import pickle
+# import pandas as pd
+
+
+PRECOMPUTED_TEST = "/content/drive/MyDrive/RAGAS_Dataset/precomputed_test4.pkl"
+
+with open(PRECOMPUTED_TEST, "rb") as f:
+    df_test= pickle.load(f)
+
+# ====== Run Id ====
+
+file_path = "/content/drive/MyDrive/RAGAS_Dataset/action_exploration_precomputed_test3_log_20250828.csv"
+
+# Read CSV into DataFrame
+test_output_df = pd.read_csv(file_path)
+print(test_output_df.columns)
+
+
+# Display basic info and first few rows
+print(f"Loaded testing with shape: {test_output_df.shape}")
+# print(test_output_df.head())
+# test_output_df=test_output_df[test_output_df['action_idx']==12]
+test_output_df["action_label"] = (
+    test_output_df["action_tuple"].astype(str)
+    + "_" + test_output_df["action_idx"].astype(str)
+)
+
+summary_df_3 = (
+    test_output_df.groupby(["action_idx","action_tuple"])
+    .agg(
+        samples=("reward_1","count"),
+        avg_reward=("reward_1","mean"),
+        avg_reward2=("context_relevance","mean")
+
+    )
+    .reset_index()
+)
+summary_df_3
+
+# 11. SetUP for the RL 
+# @title
+# ====== 1) SETUP (tailored for our artifacts: arrays + train_log_df; test enumeration optional) ======
+import os, json, math, random, datetime
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+
+# Optional (only if you want GroupKFold CV later)
+try:
+    from sklearn.model_selection import GroupKFold
+    SKLEARN_AVAILABLE = True
+except Exception:
+    SKLEARN_AVAILABLE = False
+
+# ---------- Run ID & paths ----------
+date_str = datetime.datetime.now().strftime("%Y%m%d")
+date_run_no = 1  # <-- increment manually when you re-run the same day
+run_id = f"{date_str}_optA_run{date_run_no}"
+OUT_DIR = f"/content/drive/MyDrive/Query_Adaptive_Retrieval_Config/{run_id}"
+os.makedirs(OUT_DIR, exist_ok=True)
+print("Run:", run_id, " | OUT_DIR:", OUT_DIR)
+
+# ---------- Seeds ----------
+SEED = 1337
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+# ---------- Action space ----------
+
+n_actions = len(possible_actions)
+print("n_actions:", n_actions)
+
+# ---------- Helpers ----------
+def norm_text(x):
+    if x is None: return ""
+    return " ".join(str(x).lower().strip().split())
+
+def group_key(source, question):
+    return f"{norm_text(source)}||{norm_text(question)}"
+
+def parse_vec_cell(v):
+    """Accept list/np.array or JSON-like string; returns np.float32 vector or None."""
+    if v is None or (isinstance(v, float) and np.isnan(v)): return None
+    if isinstance(v, (list, np.ndarray)):
+        return np.asarray(v, dtype=np.float32)
+    if isinstance(v, str):
+        # try JSON first
+        try:
+            x = json.loads(v)
+            return np.asarray(x, dtype=np.float32)
+        except Exception:
+            s = v.strip()
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    arr = np.fromstring(s[1:-1], sep=',', dtype=np.float32)
+                    return arr
+                except Exception:
+                    return None
+    return None
+
+def simple_numeric_feats(q, d):
+    q_tokens = str(q).split()
+    d_tokens = str(d).split()
+    q_len = len(q_tokens)
+    d_len = len(d_tokens)
+    d_sents = [s for s in str(d).split(".") if len(s.strip())>0]
+    avg_sent_len = (sum(len(s.split()) for s in d_sents) / max(1, len(d_sents)))
+    has_year = 1 if any(tok.isdigit() and len(tok)>=4 for tok in q_tokens) else 0
+    wh = str(q).lower().strip().split()[:1]
+    wh_onehot = [0,0,0,0,0]  # what, who, when, where, how
+    if wh:
+        first = wh[0]
+        if   first.startswith("what"):  wh_onehot[0]=1
+        elif first.startswith("who"):   wh_onehot[1]=1
+        elif first.startswith("when"):  wh_onehot[2]=1
+        elif first.startswith("where"): wh_onehot[3]=1
+        elif first.startswith("how"):   wh_onehot[4]=1
+    return np.asarray([q_len, d_len, avg_sent_len, has_year] + wh_onehot, dtype=np.float32)
+
+# ---------- External embed/context detection ----------
+USE_EXTERNAL_EMBED = False
+try:
+    get_context_vector  # noqa: F821
+    embed               # noqa: F821
+    USE_EXTERNAL_EMBED = True
+    print("Using our existing get_context_vector(...) and embed")
+except NameError:
+    print("No get_context_vector/embed found; will try precomputed vectors in the dataframes.")
+
+def build_feature_for_item(question, source_content):
+    """Return a 1-D np.float32 feature vector for this (q, doc)."""
+    if USE_EXTERNAL_EMBED:
+        try:
+            v = get_context_vector(question, source_content, embed)
+            v = np.asarray(v, dtype=np.float32).ravel()
+            extra = simple_numeric_feats(question, source_content)
+            return np.concatenate([v, extra], axis=0)
+        except Exception as e:
+            print("Falling back to precomputed vectors because get_context_vector failed:", e)
+    # fallback numeric-only vector; will be overridden if row has richer vectors
+    return simple_numeric_feats(question, source_content)
+
+def build_feature_from_row(row):
+    """Try per-row precomputed vectors; else external; else numeric-only."""
+    v = None
+    for colname in ["ctx_vec", "context_vec", "context_vector"]:
+        if colname in row and row[colname] is not None and not (isinstance(row[colname], float) and np.isnan(row[colname])):
+            v = parse_vec_cell(row[colname])
+            if v is not None: break
+    if v is None and "query_embed" in row and "source_embed" in row:
+        qv = parse_vec_cell(row["query_embed"]); dv = parse_vec_cell(row["source_embed"])
+        if qv is not None and dv is not None:
+            v = np.concatenate([qv, dv], axis=0).astype(np.float32)
+    if v is None and USE_EXTERNAL_EMBED:
+        try:
+            v = np.asarray(get_context_vector(row["question"], row["source_content"], embed), dtype=np.float32)
+        except Exception:
+            v = None
+    base = v if v is not None else np.zeros((0,), dtype=np.float32)
+    extra = simple_numeric_feats(row["question"], row["source_content"])
+    return np.concatenate([base, extra], axis=0)
+
+# ---------- Ensure the basic columns exist in train_df/test_df (map aliases if needed) ----------
+def ensure_source_question_columns(df, df_name="df"):
+    cols = set(df.columns)
+    # Map question alias
+    if "question" not in cols and "query" in cols:
+        df = df.rename(columns={"query":"question"})
+        cols = set(df.columns)
+        print(f"[INFO] {df_name}: using 'query' as question")
+    # Map source content column if needed
+    if "source_content" not in cols:
+        candidates = ["content","context","document","doc_text","source_text","passage_text","context_text","sourcecontent"]
+        found = None
+        for c in candidates:
+            if c in cols: found=c; break
+        if found:
+            df = df.rename(columns={found:"source_content"})
+            print(f"[INFO] {df_name}: using '{found}' as source_content")
+    return df
+
+train_df = ensure_source_question_columns(train_df, "train_df")
+test_df  = ensure_source_question_columns(test_df,  "test_df")
+
+assert {"source","question","source_content"}.issubset(set(test_df.columns)), \
+    "test_df must have columns: source, question, source_content"
+
+# ---------- Robust action standardization (for any df that HAS action info) ----------
+def coerce_action_tuple_cell(v):
+    """Accept (tuple/list), or strings like '(0.5, 3, 50)' or '0.5|3|50'."""
+    if v is None or (isinstance(v, float) and np.isnan(v)): return None
+    if isinstance(v, (tuple, list)) and len(v) == 3:
+        a, k, c = v
+        return (float(a), int(k), int(c))
+    if isinstance(v, str):
+        s = v.strip()
+        s = s.replace("[", "(").replace("]", ")").replace("{", "(").replace("}", ")").replace("|", ",")
+        if s.startswith("(") and s.endswith(")"):
+            s = s[1:-1]
+        parts = [p for p in s.split(",") if p != ""]
+        if len(parts) == 3:
+            a, k, c = parts
+            return (float(a), int(float(k)), int(float(c)))
+    return None
+
+def try_derive_tuple_from_cols(row):
+    """Try common alpha/K/chunk variants to derive tuple."""
+    candidates = [
+        ("alpha","top_k","chunk"),
+        ("alpha","top_k","chunk_size"),
+        ("alpha","K","chunk"),
+        ("alpha","k","chunk"),
+        ("alpha","topk","chunk"),
+        ("A","K","chunk"),
+        ("A","K","chunk_size"),
+        ("alpha_w","top_k","chunk"),
+        ("alpha","K","chunk_len"),
+    ]
+    for a_col, k_col, c_col in candidates:
+        if a_col in row and k_col in row and c_col in row:
+            try:
+                return (float(row[a_col]), int(row[k_col]), int(row[c_col]))
+            except Exception:
+                pass
+    return None
+
+def standardize_actions_df(df, df_name="df"):
+    """Only call this on frames that actually contain action info."""
+    if not (("action_tuple" in df.columns) or ("action_idx" in df.columns) or
+            ({"alpha","top_k","chunk"}.issubset(df.columns))):
+        print(f"[INFO] {df_name}: no action columns to standardize (skipping).")
+        return df
+
+    # 1) Start from existing tuple if present
+    if "action_tuple" in df.columns:
+        tup_series = df["action_tuple"].apply(coerce_action_tuple_cell)
+    else:
+        tup_series = pd.Series([None]*len(df), index=df.index)
+
+    # 2) Fill from action_idx if present
+    if "action_idx" in df.columns:
+        def from_idx(i):
+            try:
+                return possible_actions[int(i)]
+            except Exception:
+                return None
+        tup_series = tup_series.where(tup_series.notna(), df["action_idx"].apply(from_idx))
+
+    # 3) Fill from any alpha/K/chunk variants if still missing
+    if tup_series.isna().any():
+        need = tup_series[tup_series.isna()].index
+        if len(need) > 0:
+            derived = df.loc[need].apply(try_derive_tuple_from_cols, axis=1)
+            tup_series.loc[need] = derived
+
+    missing = int(tup_series.isna().sum())
+    if missing > 0:
+        print(f"[WARN] {df_name}: {missing} rows still lack a usable action tuple. "
+              f"First few indices: {tup_series[tup_series.isna()].index.tolist()[:5]}")
+
+    # Final standardized columns (if we have tuples)
+    df["action_tuple"] = tup_series
+    df["alpha"] = df["action_tuple"].apply(lambda t: float(t[0]) if t is not None else np.nan)
+    df["top_k"] = df["action_tuple"].apply(lambda t: int(t[1])   if t is not None else np.nan)
+    df["chunk"] = df["action_tuple"].apply(lambda t: int(t[2])   if t is not None else np.nan)
+
+    # Build/repair action_idx
+    def to_idx(t):
+        try:
+            return possible_actions.index((float(t[0]), int(t[1]), int(t[2])))
+        except Exception:
+            return np.nan
+    df["action_idx"] = df["action_tuple"].apply(lambda t: to_idx(t) if t is not None else np.nan)
+
+    print(f"[OK] {df_name}: actions standardized. Unique tuples:",
+          int(df["action_tuple"].dropna().nunique()))
+    return df
+
+# Standardize actions for train_log_df (this is our exploration log with actions/rewards)
+assert "train_log_df" in globals(), "train_log_df must be created from our checkpoint['train_log']"
+# Map aliases for columns we rely on later
+if "question" not in train_log_df.columns and "query" in train_log_df.columns:
+    train_log_df = train_log_df.rename(columns={"query":"question"})
+if "source" not in train_log_df.columns and "doc" in train_log_df.columns:
+    train_log_df = train_log_df.rename(columns={"doc":"source"})
+
+train_log_df = standardize_actions_df(train_log_df, "train_log_df")
+
+# ---------- Build TRAIN arrays from our checkpoint arrays (authoritative) ----------
+# contexts: (N, d), actions: (N,), rewards: (N,)
+N_arrays = min(len(contexts), len(actions), len(rewards))
+X_train_all = np.asarray(contexts[:N_arrays], dtype=np.float32)
+A_train_all = np.asarray(actions[:N_arrays],  dtype=np.int64)
+Y_train_all = np.asarray(rewards[:N_arrays],  dtype=np.float32)
+
+# Build group keys G from train_log_df if aligned; else use row indices
+if len(train_log_df) >= N_arrays and {"source","question"}.issubset(train_log_df.columns):
+    G_train_all = train_log_df.iloc[:N_arrays].apply(lambda r: group_key(r["source"], r["question"]), axis=1).values
+else:
+    print("[WARN] train_log_df missing source/question or length mismatch; using index-based groups.")
+    G_train_all = np.array([f"row{i}" for i in range(N_arrays)])
+
+print("TRAIN arrays:",
+      "X:", X_train_all.shape, "A:", A_train_all.shape, "Y:", Y_train_all.shape, "G:", len(G_train_all))
+
+# Save arrays (optional)
+np.savez(os.path.join(OUT_DIR, "train_arrays_27.npz"),
+         X_train_all=X_train_all, A_train_all=A_train_all, Y_train_all=Y_train_all, G_train_all=G_train_all)
+
+# ---------- TEST items: build feature cache per unique (source, query) ----------
+# Ensure test_df has the basic columns already (we checked above)
+test_df["_source_norm"] = test_df["source"].apply(norm_text)
+test_df["_query_norm"]  = test_df["question"].apply(norm_text)
+
+def make_feature_cache(df):
+    cache = {}
+    # base per unique item
+    for _, r in df[["source","question","source_content"]].drop_duplicates().iterrows():
+        gk = group_key(r["source"], r["question"])
+        cache[gk] = build_feature_for_item(r["question"], r["source_content"])
+    # overwrite with any row-specific richer vectors if present
+    for _, r in df.iterrows():
+        gk = group_key(r["source"], r["question"])
+        feat = build_feature_from_row(r)
+        if feat.shape[0] > cache[gk].shape[0]:
+            cache[gk] = feat
+    return cache
+
+test_feat_cache = make_feature_cache(test_df)
+feat_dim = len(next(iter(test_feat_cache.values())))
+print("Feature dimension (test items):", feat_dim)
+
+# ---------- TEST enumeration table (for exact reward lookup) ----------
+test_enum_df = pd.read_csv("/content/drive/MyDrive/RAGAS_Dataset/action_exploration_precomputed_test3_log_20250828.csv")
+HAS_ENUM_TEST = False
+precomp_idx = None
+
+if "test_enum_df" in globals():
+    # Make sure it has source/question; map aliases if needed
+    enum_df = ensure_source_question_columns(test_enum_df, "test_enum_df")
+    # Standardize actions on the enum table (must have alpha/top_k/chunk or action_tuple or action_idx)
+    enum_df = standardize_actions_df(enum_df, "test_enum_df")
+    # Ensure reward column exists (try common names)
+    reward_col = None
+    for cand in ["reward_1","reward","mean_reward","final_reward","avg_reward"]:
+        if cand in enum_df.columns:
+            reward_col = cand; break
+    if reward_col is None:
+        # try to synthesize if metrics present
+        metric_candidates = [("faithfulness","answer_relevance","context_relevance"),
+                             ("faith","ans_rel","ctx_rel")]
+        got = None
+        for f,a,c in metric_candidates:
+            if {f,a,c}.issubset(enum_df.columns):
+                enum_df["reward_1"] = (enum_df[f]+enum_df[a]+enum_df[c])/3.0
+                reward_col = "reward_1"; got=True; break
+        if reward_col is None:
+            raise AssertionError("test_enum_df must contain reward_1 (or reward) or the three metric columns to synthesize it.")
+    # Build lookup index
+    enum_df["_source_norm"]  = enum_df["source"].apply(norm_text)
+    enum_df["_query_norm"]   = enum_df["question"].apply(norm_text)
+    enum_df["_action_tuple"] = enum_df["action_tuple"].apply(lambda t: (float(t[0]), int(t[1]), int(t[2])))
+    precomp_idx = enum_df.set_index(["_source_norm","_query_norm","_action_tuple"])
+    HAS_ENUM_TEST = True
+    print("[OK] test_enum_df ready for exact reward lookup. Unique items:",
+          enum_df[["_source_norm","_query_norm"]].drop_duplicates().shape[0])
+else:
+    # If our test_df itself is already enumerated (contains action info & rewards), use it directly
+    if ({"alpha","top_k","chunk"}.issubset(test_df.columns) or "action_tuple" in test_df.columns or "action_idx" in test_df.columns):
+        # standardize and look for reward
+        test_df_std = standardize_actions_df(test_df.copy(), "test_df(enumerated?)")
+        reward_col = None
+        for cand in ["reward_1","reward","mean_reward","final_reward","avg_reward"]:
+            if cand in test_df_std.columns:
+                reward_col = cand; break
+        if reward_col is not None:
+            test_df_std["_source_norm"]  = test_df_std["source"].apply(norm_text)
+            test_df_std["_query_norm"]   = test_df_std["question"].apply(norm_text)
+            test_df_std["_action_tuple"] = test_df_std["action_tuple"].apply(lambda t: (float(t[0]), int(t[1]), int(t[2])))
+            precomp_idx = test_df_std.set_index(["_source_norm","_query_norm","_action_tuple"])
+            HAS_ENUM_TEST = True
+            print("[OK] test_df appears to be enumerated; using it for exact reward lookup.")
+        else:
+            print("[WARN] test_df has action columns but no reward column; cannot build lookup yet.")
+    else:
+        print("[INFO] No enumerated test table found. To enable exact testing, set a DataFrame variable named "
+              "'test_enum_df' with columns: source, question, (alpha/top_k/chunk or action_tuple), and reward_1.")
+
+# ---------- Summary ----------
+print("\n=== SETUP SUMMARY ===")
+print("Train arrays:", X_train_all.shape, A_train_all.shape, Y_train_all.shape)
+print("Group keys:", len(G_train_all))
+print("Test items (unique):", test_df[['_source_norm','_query_norm']].drop_duplicates().shape[0])
+print("Has enumerated test table?:", HAS_ENUM_TEST)
+
+#12.1 27-ACTION SHARED REWARD NETWORK_2050913
+
+# -------------------------
+# (I) SETUP
+# -------------------------
+import os, json, time
+from datetime import datetime
+import numpy as np, pandas as pd
+import torch, torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+from scipy import stats
+
+# ---- Guards: we assume these exist in your environment ----
+need = ["possible_actions","train_df","test_df","train_log_df","test_output_df",
+        "standardize_actions_df","group_key","norm_text",
+        "build_feature_for_item","build_feature_from_row"]
+for n in need:
+    assert n in globals(), f"Missing required object/function: {n}"
+
+# ---- Unique run directory under OUT_DIR ----
+OUT_DIR = OUT_DIR if "OUT_DIR" in globals() else "./runs"
+os.makedirs(OUT_DIR, exist_ok=True)
+RUN_NAME = f"srn27_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+RUN_DIR = os.path.join(OUT_DIR, RUN_NAME)
+os.makedirs(RUN_DIR, exist_ok=True)
+print(f"[RUN DIR] {RUN_DIR}")
+
+# ---- Device & seeds (simple) ----
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+np.random.seed(1337); torch.manual_seed(1337)
+
+# ---- Small helpers for metrics ----
+def _regression_metrics(y_true, y_pred):
+    """Return dict: mse, mae, rmse, r2, n (nan-safe)."""
+    yt = np.asarray(y_true, dtype=np.float64)
+    yp = np.asarray(y_pred, dtype=np.float64)
+    m = np.isfinite(yt) & np.isfinite(yp)
+    yt, yp = yt[m], yp[m]
+    if len(yt) == 0:
+        return dict(mse=np.nan, mae=np.nan, rmse=np.nan, r2=np.nan, n=0)
+    mse = float(np.mean((yp - yt) ** 2))
+    mae = float(np.mean(np.abs(yp - yt)))
+    rmse = float(np.sqrt(mse))
+    if len(yt) > 1 and np.var(yt) > 1e-12:
+        r2 = float(1.0 - np.sum((yp - yt) ** 2) / np.sum((yt - yt.mean()) ** 2))
+    else:
+        r2 = np.nan
+    return dict(mse=mse, mae=mae, rmse=rmse, r2=r2, n=len(yt))
+
+def _print_metrics(prefix, m):
+    print(f"{prefix}: MSE={m['mse']:.6f} | RMSE={m['rmse']:.6f} | "
+          f"MAE={m['mae']:.6f} | R^2={m['r2']:.4f} | N={m['n']}")
+
+# ---- Build TEST enumerated lookup (full 27x grid) ----
+enum_df = test_output_df.copy()
+if "question" not in enum_df.columns and "query" in enum_df.columns:
+    enum_df = enum_df.rename(columns={"query":"question"})
+enum_df = standardize_actions_df(enum_df, "test_enum_df (from test_output_df)")
+
+# ensure reward_1 exists
+if "reward_1" not in enum_df.columns:
+    found=False
+    for f,a,c in [("faithfulness","answer_relevance","context_relevance"),
+                  ("faith","ans_rel","ctx_rel")]:
+        if {f,a,c}.issubset(enum_df.columns):
+            enum_df["reward_1"] = (
+                pd.to_numeric(enum_df[f], errors="coerce") +
+                pd.to_numeric(enum_df[a], errors="coerce") +
+                pd.to_numeric(enum_df[c], errors="coerce")
+            )/3.0
+            found=True; break
+    if not found:
+        for cand in ["reward","mean_reward","final_reward","avg_reward"]:
+            if cand in enum_df.columns:
+                enum_df["reward_1"] = pd.to_numeric(enum_df[cand], errors="coerce"); found=True; break
+    assert found, "TEST enumerated table must have reward_1 or metrics to synthesize it."
+
+# normalized keys + canonical action tuple
+enum_df["_source_norm"]  = enum_df["source"].apply(norm_text)
+enum_df["_query_norm"]   = enum_df["question"].apply(norm_text)
+enum_df["_action_tuple"] = enum_df["action_tuple"].apply(lambda t: (float(t[0]), int(t[1]), int(t[2])))
+
+# MultiIndex for fast lookup
+precomp_idx_test = (enum_df
+                    .set_index(["_source_norm","_query_norm","_action_tuple"])
+                    .sort_index())
+
+# Check full grid coverage
+enum_actions = set(enum_df["_action_tuple"].dropna().tolist())
+grid_actions = set((float(a),int(k),int(c)) for (a,k,c) in possible_actions)
+print("[EVAL setup] items on TEST:", precomp_idx_test.groupby(level=[0,1]).ngroups,
+      "| action grid match?:", enum_actions == grid_actions)
+
+# Detect metric column names on TEST (optional sheets)
+def _metric_names(df):
+    cols = df.columns
+    if {"faithfulness","answer_relevance","context_relevance"}.issubset(cols):
+        return ("faithfulness","answer_relevance","context_relevance")
+    if {"faith","ans_rel","ctx_rel"}.issubset(cols):
+        return ("faith","ans_rel","ctx_rel")
+    return (None, None, None)
+MET_F, MET_A, MET_C = _metric_names(enum_df)
+
+# ---- Build TRAIN aggregated table (one row per (item, action)) ----
+tr = train_log_df.copy()
+if "question" not in tr.columns and "query" in tr.columns:
+    tr = tr.rename(columns={"query":"question"})
+tr = standardize_actions_df(tr, "train_log_df(SRN27)")
+
+# ensure reward_1 exists
+if "reward_1" not in tr.columns:
+    found=False
+    for f,a,c in [("faithfulness","answer_relevance","context_relevance"),
+                  ("faith","ans_rel","ctx_rel")]:
+        if {f,a,c}.issubset(tr.columns):
+            tr["reward_1"] = (
+                pd.to_numeric(tr[f], errors="coerce") +
+                pd.to_numeric(tr[a], errors="coerce") +
+                pd.to_numeric(tr[c], errors="coerce")
+            )/3.0
+            found=True; break
+    if not found:
+        for cand in ["reward","mean_reward","final_reward","avg_reward"]:
+            if cand in tr.columns:
+                tr["reward_1"] = pd.to_numeric(tr[cand], errors="coerce"); found=True; break
+    assert found, "TRAIN logs must have reward_1 or metrics."
+
+# normalize keys + action tuple
+tr["_source_norm"]  = tr["source"].apply(norm_text)
+tr["_query_norm"]   = tr["question"].apply(norm_text)
+tr["_action_tuple"] = tr["action_tuple"].apply(lambda t: (float(t[0]), int(t[1]), int(t[2])))
+
+# average duplicates per (item, action)
+train_avg = (tr.groupby(["_source_norm","_query_norm","_action_tuple"], as_index=False)["reward_1"]
+               .mean()
+               .rename(columns={"reward_1":"reward_1"}))
+
+# MultiIndex TRAIN lookup
+precomp_idx_train = (train_avg
+                     .set_index(["_source_norm","_query_norm","_action_tuple"])
+                     .sort_index())
+
+# ---- Build item-level feature caches (TRAIN + TEST) ----
+def ensure_sq(df):
+    if "question" not in df.columns and "query" in df.columns:
+        df = df.rename(columns={"query":"question"})
+    if "source_content" not in df.columns:
+        df["source_content"] = ""
+    return df
+
+train_df_ = ensure_sq(train_df.copy())
+test_df_  = ensure_sq(test_df.copy())
+
+def make_feature_cache(df):
+    cache = {}
+    # base vector per unique (source, question)
+    for _, r in df[["source","question","source_content"]].drop_duplicates().iterrows():
+        gk = group_key(r["source"], r["question"])
+        cache[gk] = build_feature_for_item(r["question"], r["source_content"])
+    # if any row has a longer vector, keep that
+    for _, r in df.iterrows():
+        gk = group_key(r["source"], r["question"])
+        v  = build_feature_from_row(r)
+        if v.shape[0] > cache[gk].shape[0]:
+            cache[gk] = v
+    return cache
+
+train_feat_cache = make_feature_cache(train_df_)
+if "test_feat_cache" not in globals() or len(test_feat_cache) == 0:
+    test_feat_cache = make_feature_cache(test_df_)
+
+# align dims by padding with zeros
+D_item = max(max(len(v) for v in train_feat_cache.values()),
+             max(len(v) for v in test_feat_cache.values()))
+def pad(v, D=D_item):
+    out = np.zeros(D, dtype=np.float32)
+    v = np.asarray(v, dtype=np.float32).ravel()
+    out[:len(v)] = v
+    return out
+for k in list(train_feat_cache.keys()): train_feat_cache[k] = pad(train_feat_cache[k])
+for k in list(test_feat_cache.keys()):  test_feat_cache[k]  = pad(test_feat_cache[k])
+
+# ---- Build TRAIN tuples: X (item vec), A (action idx), Y (reward) ----
+X_rows, A_rows, Y_rows = [], [], []
+for _, r in train_avg.iterrows():
+    sn, qn = r["_source_norm"], r["_query_norm"]
+    a_tup  = tuple(r["_action_tuple"])
+    # locate original (source, question) to fetch feature vec
+    m = (train_df_["source"].apply(norm_text) == sn) & (train_df_["question"].apply(norm_text) == qn)
+    if not m.any(): continue
+    r0 = train_df_[m].iloc[0]
+    gk = group_key(r0["source"], r0["question"])
+    if gk not in train_feat_cache: continue
+    X_rows.append(train_feat_cache[gk])
+    A_rows.append(int(possible_actions.index((float(a_tup[0]), int(a_tup[1]), int(a_tup[2])))))
+    Y_rows.append(float(r["reward_1"]))
+
+X_tr_all = np.stack(X_rows).astype(np.float32)
+A_tr_all = np.asarray(A_rows, dtype=np.int64)
+Y_tr_all = np.asarray(Y_rows, dtype=np.float32)
+print("[SRN27] Train tuples:", X_tr_all.shape, A_tr_all.shape, Y_tr_all.shape)
+
+# ---- Static baselines we’ll report on TEST ----
+BEST_TRAIN_STATIC = (0.7, 3, 50)  # as requested
+BEST_TEST_STATIC  = (0.5, 3, 50)  # as requested
+
+# -------------------------
+# (II) TRAINING
+# -------------------------
+
+# ---- Hyperparameters (simple dict) ----
+HYP = dict(
+    hidden=512,
+    p_drop=0.4,
+    lr=1e-3,
+    weight_decay=1e-4,
+    max_epochs=120,
+    patience=12,
+    batch_size=128,
+    d_in=int(D_item),
+    n_actions=int(len(possible_actions)),
+    device=str(device)
+)
+hp_df = pd.DataFrame([HYP])
+print("\n=== Hyperparameters ===")
+print(hp_df.to_string(index=False))
+
+# ---- Model: Shared Reward Network → 27 outputs ----
+class SRN27(nn.Module):
+    def __init__(self, d_in, n_actions, hidden=512, p_drop=0.4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_in, hidden), nn.ReLU(), nn.Dropout(p_drop),
+            nn.Linear(hidden, hidden//2), nn.ReLU(), nn.Dropout(p_drop),
+            nn.Linear(hidden//2, n_actions)
+        )
+    def forward(self, x):
+        return self.net(x)  # [B, n_actions]
+
+# ---- Standardize features by TRAIN stats ----
+Xmu = X_tr_all.mean(axis=0) if len(X_tr_all)>0 else np.zeros(D_item, np.float32)
+Xsd = X_tr_all.std(axis=0)  if len(X_tr_all)>0 else np.ones(D_item,  np.float32)
+Xsd = Xsd + 1e-6  # avoid division by zero
+def standardize_train(X): return (X - Xmu)/Xsd
+
+# ---- Dataset / Dataloader for supervised training (γ=0 → direct reward) ----
+Xs = standardize_train(X_tr_all)
+ds = TensorDataset(torch.tensor(Xs, dtype=torch.float32),
+                   torch.tensor(A_tr_all, dtype=torch.long),
+                   torch.tensor(Y_tr_all.reshape(-1,1), dtype=torch.float32))
+dl = DataLoader(ds, batch_size=int(HYP["batch_size"]), shuffle=True)
+
+# ---- Train loop with simple early stopping on MSE ----
+model = SRN27(d_in=D_item, n_actions=len(possible_actions),
+              hidden=int(HYP["hidden"]), p_drop=float(HYP["p_drop"])).to(device)
+opt   = torch.optim.AdamW(model.parameters(), lr=float(HYP["lr"]),
+                          weight_decay=float(HYP["weight_decay"]))
+loss_fn = nn.MSELoss()
+
+best = 1e9; best_state=None; wait=0
+for ep in range(1, int(HYP["max_epochs"])+1):
+    model.train(); tot=0.0; N=0
+    for xb, ab, yb in dl:
+        xb, ab, yb = xb.to(device), ab.to(device), yb.to(device)
+        opt.zero_grad()
+        q_all = model(xb)                        # [B,27]
+        q_sa  = q_all.gather(1, ab.view(-1,1))  # take the column for A
+        loss  = loss_fn(q_sa, yb)               # MSE to immediate reward
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        tot += float(loss.item()) * len(xb); N += len(xb)
+    avg = tot/max(1,N)
+    if avg < best - 1e-6:
+        best = avg
+        best_state = {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}
+        wait = 0
+    else:
+        wait += 1
+        if wait >= int(HYP["patience"]):
+            break
+    print(f"[Epoch {ep:03d}] train MSE={avg:.6f} | best={best:.6f}")
+
+if best_state is not None:
+    model.load_state_dict(best_state)
+model.eval()
+
+# ---- TRAIN tuple fit metrics (MAE/RMSE/MSE/R^2) ----
+with torch.no_grad():
+    xb = torch.tensor(standardize_train(X_tr_all), dtype=torch.float32, device=device)
+    q_all = model(xb).detach().cpu().numpy()  # [N,27]
+y_hat = np.array([q_all[i, A_tr_all[i]] for i in range(len(A_tr_all))], dtype=np.float32)
+train_fit = _regression_metrics(Y_tr_all, y_hat)
+print("\n=== TRAIN tuple fit (SRN27) ===")
+_print_metrics("  Train", train_fit)  # <-- keep a space after underscore for clarity in plain text editors
+# (Python note: remove the space above if your editor complains)
+
+# ---- Save model + scalers (safe types → PyTorch 2.6 weights_only loader friendly) ----
+MODEL_PATH = os.path.join(RUN_DIR, "srn27_model.pth")
+torch.save({
+    "state_dict": model.state_dict(),
+    "d_in": int(HYP["d_in"]),
+    "n_actions": int(HYP["n_actions"]),
+    "hidden": int(HYP["hidden"]),
+    "p_drop": float(HYP["p_drop"]),
+    "Xmu": Xmu.tolist(),   # lists → no numpy reconstruct during load
+    "Xsd": Xsd.tolist()
+}, MODEL_PATH)
+print(f"[MODEL SAVED] {MODEL_PATH}")
+
+
+# -------------------------
+# (III) TESTING
+# -------------------------
+
+# ---- Reload model + scalers (test is isolated from train step) ----
+ckpt = torch.load(MODEL_PATH, map_location=device)  # dict contains only safe types + tensors
+model_te = SRN27(d_in=ckpt["d_in"], n_actions=ckpt["n_actions"],
+                 hidden=ckpt["hidden"], p_drop=ckpt["p_drop"]).to(device)
+model_te.load_state_dict(ckpt["state_dict"]); model_te.eval()
+Xmu_te = np.array(ckpt["Xmu"], dtype=np.float32)
+Xsd_te = np.array(ckpt["Xsd"], dtype=np.float32) + 1e-6
+def standardize_test(X): return (X - Xmu_te)/Xsd_te
+
+# ---- Helpers for TEST lookup ----
+def _get_enum_row(sn, qn, a_tup):
+    """Return a row (Series) from TEST enumerated MultiIndex; None if missing."""
+    key = (float(a_tup[0]), int(a_tup[1]), int(a_tup[2]))
+    try:
+        row = precomp_idx_test.loc[(sn, qn, key)]
+        if isinstance(row, pd.DataFrame): row = row.iloc[0]
+        return row
+    except KeyError:
+        return None
+
+@torch.no_grad()
+def _q_all_actions(model, x_vec):
+    xs = standardize_test(x_vec)
+    xb = torch.tensor(xs, dtype=torch.float32, device=device).view(1,-1)
+    return model(xb).squeeze(0).detach().cpu().numpy()  # [27]
+
+# ---- Build unique test items ----
+test_items = enum_df[["_source_norm","_query_norm","source","question"]].drop_duplicates()
+
+# ---- Policy vs statics on TEST + per-item details ----
+test_pol, test_sta_train, test_sta_test, test_orc = [], [], [], []
+per_item_rows = []
+
+for _, r in test_items.iterrows():
+    sn, qn = r["_source_norm"], r["_query_norm"]
+    gk     = group_key(r["source"], r["question"])
+    x_vec  = test_feat_cache.get(gk, np.zeros(D_item, dtype=np.float32))
+
+    # model prediction over all 27 actions
+    qv = _q_all_actions(model_te, x_vec)
+    pred_idx = int(np.argmax(qv))
+    pred_tup = possible_actions[pred_idx]
+
+    # fetch rows for predicted + both statics
+    row_pred = _get_enum_row(sn, qn, pred_tup)
+    row_tr   = _get_enum_row(sn, qn, BEST_TRAIN_STATIC)
+    row_te   = _get_enum_row(sn, qn, BEST_TEST_STATIC)
+    if (row_pred is None) or (row_tr is None) or (row_te is None):
+        continue
+
+    r_pred = float(row_pred["reward_1"])
+    r_tr   = float(row_tr["reward_1"])
+    r_te   = float(row_te["reward_1"])
+
+    # oracle from enumerated table
+    try:
+        sub = precomp_idx_test.xs((sn, qn), level=(0,1))
+        r_orc = float(sub["reward_1"].max())
+    except KeyError:
+        continue
+
+    # collect paired arrays
+    test_pol.append(r_pred)
+    test_sta_train.append(r_tr)
+    test_sta_test.append(r_te)
+    test_orc.append(r_orc)
+
+    # pick metric values if exist
+    def _get(sr, name):
+        return float(pd.to_numeric(sr[name], errors="coerce")) if (name is not None and name in sr.index) else np.nan
+
+    pred_f = _get(row_pred, MET_F); pred_a = _get(row_pred, MET_A); pred_c = _get(row_pred, MET_C)
+    tr_f   = _get(row_tr,   MET_F); tr_a   = _get(row_tr,   MET_A); tr_c   = _get(row_tr,   MET_C)
+    te_f   = _get(row_te,   MET_F); te_a   = _get(row_te,   MET_A); te_c   = _get(row_te,   MET_C)
+
+    per_item_rows.append({
+        "source": r["source"], "question": r["question"],
+        "model_pred_action":    str(tuple(pred_tup)),
+        "model_pred_reward":    r_pred,
+        "model_pred_faithfulness": pred_f,
+        "model_pred_answer_relevance": pred_a,
+        "model_pred_context_relevance": pred_c,
+        "best_train_static_action": str(BEST_TRAIN_STATIC),
+        "best_train_static_reward": r_tr,
+        "best_train_static_faithfulness": tr_f,
+        "best_train_static_answer_relevance": tr_a,
+        "best_train_static_context_relevance": tr_c,
+        "best_test_static_action": str(BEST_TEST_STATIC),
+        "best_test_static_reward": r_te,
+        "best_test_static_faithfulness": te_f,
+        "best_test_static_answer_relevance": te_a,
+        "best_test_static_context_relevance": te_c,
+        "oracle_reward": r_orc
+    })
+
+test_pol       = np.asarray(test_pol, dtype=np.float32)
+test_sta_train = np.asarray(test_sta_train, dtype=np.float32)
+test_sta_test  = np.asarray(test_sta_test,  dtype=np.float32)
+test_orc       = np.asarray(test_orc, dtype=np.float32)
+
+# ---- Paired t-tests on TEST ----
+if len(test_pol) >= 2:
+    t_tr, p_tr = stats.ttest_rel(test_pol, test_sta_train, nan_policy="omit")
+    t_te, p_te = stats.ttest_rel(test_pol, test_sta_test,  nan_policy="omit")
+else:
+    t_tr = p_tr = t_te = p_te = np.nan
+
+print("\n=== TEST policy performance (enumerated) ===")
+print(f"[vs best TRAIN (0.7,3,50)] N={len(test_pol)} | "
+      f"policy={test_pol.mean():.4f} | static={test_sta_train.mean():.4f} | "
+      f"Δ={(test_pol - test_sta_train).mean():.4f} | "
+      f"regret={(test_orc - test_pol).mean():.4f} | t={t_tr:.3f} p={p_tr:.4g}")
+
+print(f"[vs best TEST  (0.5,3,50)] N={len(test_pol)} | "
+      f"policy={test_pol.mean():.4f} | static={test_sta_test.mean():.4f} | "
+      f"Δ={(test_pol - test_sta_test).mean():.4f} | "
+      f"regret={(test_orc - test_pol).mean():.4f} | t={t_te:.3f} p={p_te:.4g}")
+
+# ---- TEST grid regression (MAE/RMSE/MSE/R^2 + top1@oracle) ----
+grid_true, grid_pred = [], []
+hits, N_items_top1 = 0, 0
+
+for (sn, qn), g in enum_df.groupby(["_source_norm","_query_norm"]):
+    # feature vec for this (source, question)
+    r0 = g.iloc[0]
+    gk = group_key(r0["source"], r0["question"])
+    x_vec = test_feat_cache.get(gk, None)
+    if x_vec is None: continue
+
+    # local index of enumerated actions for faster lookup
+    g_idx = g.set_index("_action_tuple").sort_index()
+
+    # predicted vector over 27 actions
+    pred_vec = _q_all_actions(model_te, x_vec)
+
+    true_vec = []
+    ok = True
+    for a in possible_actions:
+        key = (float(a[0]), int(a[1]), int(a[2]))
+        if key not in g_idx.index:
+            ok = False; break
+        # robust MultiIndex access (avoids "Too many indexers")
+        true_val = float(g_idx.loc[[key], "reward_1"].iloc[0])
+        true_vec.append(true_val)
+    if not ok:
+        continue
+
+    grid_true.extend(true_vec)
+    grid_pred.extend(pred_vec.tolist())
+
+    # top-1 hit vs oracle (by action)
+    if int(np.argmax(pred_vec)) == int(np.argmax(true_vec)):
+        hits += 1
+    N_items_top1 += 1
+
+grid_fit = _regression_metrics(grid_true, grid_pred)
+print("\n=== TEST model metrics (enumerated grid) ===")
+_print_metrics("  Test grid fit", grid_fit)  # (remove space if your editor complains)
+if N_items_top1 > 0:
+    print(f"  Top-1 hit rate vs oracle (items): {hits}/{N_items_top1} = {hits/N_items_top1:.3f}")
+
+# ---- Save everything to ONE Excel in the run dir ----
+EXCEL_PATH = os.path.join(RUN_DIR, "srn27_results.xlsx")
+
+hp_tbl = hp_df.copy()
+train_tbl = pd.DataFrame([{
+    "MSE": train_fit["mse"], "RMSE": train_fit["rmse"], "MAE": train_fit["mae"], "R2": train_fit["r2"], "N": train_fit["n"]
+}])
+test_policy_tbl = pd.DataFrame([{
+    "N_items": int(len(test_pol)),
+    "policy_mean": float(test_pol.mean()) if len(test_pol)>0 else np.nan,
+    "static_train(0.7,3,50)_mean": float(test_sta_train.mean()) if len(test_sta_train)>0 else np.nan,
+    "static_test(0.5,3,50)_mean":  float(test_sta_test.mean())  if len(test_sta_test)>0  else np.nan,
+    "delta_vs_train_static": float((test_pol - test_sta_train).mean()) if len(test_pol)>0 else np.nan,
+    "delta_vs_test_static":  float((test_pol - test_sta_test).mean())  if len(test_pol)>0 else np.nan,
+    "regret_vs_oracle": float((test_orc - test_pol).mean()) if len(test_pol)>0 else np.nan,
+    "t_vs_train_static": float(t_tr) if t_tr==t_tr else np.nan,
+    "p_vs_train_static": float(p_tr) if p_tr==p_tr else np.nan,
+    "t_vs_test_static": float(t_te) if t_te==t_te else np.nan,
+    "p_vs_test_static": float(p_te) if p_te==p_te else np.nan
+}])
+test_grid_tbl = pd.DataFrame([{
+    "grid_MSE": grid_fit["mse"], "grid_RMSE": grid_fit["rmse"],
+    "grid_MAE": grid_fit["mae"], "grid_R2": grid_fit["r2"], "N_pairs": grid_fit["n"],
+    "top1@oracle_items": (hits/N_items_top1 if N_items_top1>0 else np.nan)
+}])
+per_item_df = pd.DataFrame(per_item_rows)
+
+with pd.ExcelWriter(EXCEL_PATH, engine="xlsxwriter") as w:
+    hp_tbl.to_excel(w, sheet_name="hyperparams", index=False)
+    train_tbl.to_excel(w, sheet_name="train_fit", index=False)
+    test_policy_tbl.to_excel(w, sheet_name="test_policy", index=False)
+    test_grid_tbl.to_excel(w, sheet_name="test_grid", index=False)
+    per_item_df.to_excel(w, sheet_name="test_per_item", index=False)
+
+print(f"\n[EXCEL SAVED] {EXCEL_PATH}")
+print("[DONE] Check your run dir for the model + Excel:", RUN_DIR)
+
+
+# 12.2
+# =====================================================================================================================================
+# 27× CONTEXTUAL BANDIT (one model per action) for RAG retrieval with ε‑greedy exploration vs. exploitation policy and a feedback loop
+# =====================================================================================================================================
+
+# -------------------------
+# (I) SETUP
+# -------------------------
+import os, json, time, random
+from datetime import datetime
+import numpy as np, pandas as pd
+import torch, torch.nn as nn
+from torch.utils.data import DataLoader
+from scipy import stats
+
+# ---- Guards: we assume these exist in your environment ----
+need = ["possible_actions","train_df","test_df","train_log_df","test_output_df",
+        "standardize_actions_df","group_key","norm_text",
+        "build_feature_for_item","build_feature_from_row"]
+for n in need:
+    assert n in globals(), f"Missing required object/function: {n}"
+
+# ---- Unique run directory under OUT_DIR ----
+OUT_DIR = OUT_DIR if "OUT_DIR" in globals() else "./runs"
+os.makedirs(OUT_DIR, exist_ok=True)
+RUN_NAME = f"cb27_bandit_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+RUN_DIR = os.path.join(OUT_DIR, RUN_NAME)
+os.makedirs(RUN_DIR, exist_ok=True)
+print(f"[RUN DIR] {RUN_DIR}")
+
+# ---- Device & seeds ----
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+np.random.seed(1337); random.seed(1337); torch.manual_seed(1337)
+
+# ---- Helpers: metrics ----
+def regression_metrics(y_true, y_pred):
+    """Return dict: mse, mae, rmse, r2, n (nan-safe)."""
+    yt = np.asarray(y_true, dtype=np.float64)
+    yp = np.asarray(y_pred, dtype=np.float64)
+    m = np.isfinite(yt) & np.isfinite(yp)
+    yt, yp = yt[m], yp[m]
+    if len(yt) == 0:
+        return dict(mse=np.nan, mae=np.nan, rmse=np.nan, r2=np.nan, n=0)
+    mse = float(np.mean((yp - yt) ** 2))
+    mae = float(np.mean(np.abs(yp - yt)))
+    rmse = float(np.sqrt(mse))
+    if len(yt) > 1 and np.var(yt) > 1e-12:
+        r2 = float(1.0 - np.sum((yp - yt) ** 2) / np.sum((yt - yt.mean()) ** 2))
+    else:
+        r2 = np.nan
+    return dict(mse=mse, mae=mae, rmse=rmse, r2=r2, n=len(yt))
+
+def print_metrics(prefix, m):
+    print(f"{prefix}: MSE={m['mse']:.6f} | RMSE={m['rmse']:.6f} | "
+          f"MAE={m['mae']:.6f} | R^2={m['r2']:.4f} | N={m['n']}")
+
+def _safe_r2(y_true, y_pred):
+    yt = np.asarray(y_true, dtype=np.float64)
+    yp = np.asarray(y_pred, dtype=np.float64)
+    m  = np.isfinite(yt) & np.isfinite(yp)
+    yt, yp = yt[m], yp[m]
+    if len(yt) < 2 or np.var(yt) <= 1e-12:
+        return np.nan
+    sse = float(np.sum((yp - yt) ** 2))
+    sst = float(np.sum((yt - yt.mean()) ** 2))
+    return float(1.0 - sse / max(sst, 1e-12))
+
+# ---- Build TEST enumerated lookup (full 27x grid) ----
+enum_df = test_output_df.copy()
+if "question" not in enum_df.columns and "query" in enum_df.columns:
+    enum_df = enum_df.rename(columns={"query":"question"})
+enum_df = standardize_actions_df(enum_df, "test_enum_df (from test_output_df)")
+
+# ensure reward_1 exists on TEST
+if "reward_1" not in enum_df.columns:
+    found=False
+    for f,a,c in [("faithfulness","answer_relevance","context_relevance"),
+                  ("faith","ans_rel","ctx_rel")]:
+        if {f,a,c}.issubset(enum_df.columns):
+            enum_df["reward_1"] = (
+                pd.to_numeric(enum_df[f], errors="coerce") +
+                pd.to_numeric(enum_df[a], errors="coerce") +
+                pd.to_numeric(enum_df[c], errors="coerce")
+            )/3.0
+            found=True; break
+    if not found:
+        for cand in ["reward","mean_reward","final_reward","avg_reward"]:
+            if cand in enum_df.columns:
+                enum_df["reward_1"] = pd.to_numeric(enum_df[cand], errors="coerce"); found=True; break
+    assert found, "TEST enumerated table must have reward_1 or metrics to synthesize it."
+
+enum_df["_source_norm"]  = enum_df["source"].apply(norm_text)
+enum_df["_query_norm"]   = enum_df["question"].apply(norm_text)
+enum_df["_action_tuple"] = enum_df["action_tuple"].apply(lambda t: (float(t[0]), int(t[1]), int(t[2])))
+
+precomp_idx_test = (enum_df
+                    .set_index(["_source_norm","_query_norm","_action_tuple"])
+                    .sort_index())
+
+# grid coverage check (should be full 27 per item)
+enum_actions = set(enum_df["_action_tuple"].dropna().tolist())
+grid_actions = set((float(a),int(k),int(c)) for (a,k,c) in possible_actions)
+print("[EVAL setup] TEST items:", precomp_idx_test.groupby(level=[0,1]).ngroups,
+      "| action grid match?:", enum_actions == grid_actions)
+
+# metric column names (optional for reporting in per-item sheet)
+def metric_names(df):
+    cols = set(df.columns)
+    if {"faithfulness","answer_relevance","context_relevance"}.issubset(cols):
+        return ("faithfulness","answer_relevance","context_relevance")
+    if {"faith","ans_rel","ctx_rel"}.issubset(cols):
+        return ("faith","ans_rel","ctx_rel")
+    return (None, None, None)
+MET_F, MET_A, MET_C = metric_names(enum_df)
+
+# ---- Build TRAIN aggregated table from logs (mean per (item, action)) ----
+tr = train_log_df.copy()
+if "question" not in tr.columns and "query" in tr.columns:
+    tr = tr.rename(columns={"query":"question"})
+tr = standardize_actions_df(tr, "train_log_df(CB-27)")
+
+# ensure reward_1 exists on TRAIN
+if "reward_1" not in tr.columns:
+    found=False
+    for f,a,c in [("faithfulness","answer_relevance","context_relevance"),
+                  ("faith","ans_rel","ctx_rel")]:
+        if {f,a,c}.issubset(tr.columns):
+            tr["reward_1"] = (
+                pd.to_numeric(tr[f], errors="coerce") +
+                pd.to_numeric(tr[a], errors="coerce") +
+                pd.to_numeric(tr[c], errors="coerce")
+            )/3.0
+            found=True; break
+    if not found:
+        for cand in ["reward","mean_reward","final_reward","avg_reward"]:
+            if cand in tr.columns:
+                tr["reward_1"] = pd.to_numeric(tr[cand], errors="coerce"); found=True; break
+    assert found, "TRAIN logs must have reward_1 or metrics."
+
+tr["_source_norm"]  = tr["source"].apply(norm_text)
+tr["_query_norm"]   = tr["question"].apply(norm_text)
+tr["_action_tuple"] = tr["action_tuple"].apply(lambda t: (float(t[0]), int(t[1]), int(t[2])))
+
+train_avg = (tr.groupby(["_source_norm","_query_norm","_action_tuple"], as_index=False)["reward_1"]
+               .mean()
+               .rename(columns={"reward_1":"reward_1"}))
+
+precomp_idx_train = (train_avg
+                     .set_index(["_source_norm","_query_norm","_action_tuple"])
+                     .sort_index())
+
+# ---- Which actions are available (logged) per TRAIN item (used for exploration) ----
+actions_per_item = {}
+for (sn, qn), g in train_avg.groupby(["_source_norm","_query_norm"]):
+    actions_per_item[(sn,qn)] = [tuple(x) for x in g["_action_tuple"].tolist()]
+
+# ---- Build item-level feature caches (TRAIN + TEST) ----
+def ensure_sq(df):
+    if "question" not in df.columns and "query" in df.columns:
+        df = df.rename(columns={"query":"question"})
+    if "source_content" not in df.columns:
+        df["source_content"] = ""
+    return df
+
+train_df_ = ensure_sq(train_df.copy())
+test_df_  = ensure_sq(test_df.copy())
+
+def make_feature_cache(df):
+    cache = {}
+    # base vector per unique (source, question)
+    for _, r in df[["source","question","source_content"]].drop_duplicates().iterrows():
+        gk = group_key(r["source"], r["question"])
+        cache[gk] = build_feature_for_item(r["question"], r["source_content"])
+    # if any row has a longer vector, keep that
+    for _, r in df.iterrows():
+        gk = group_key(r["source"], r["question"])
+        v  = build_feature_from_row(r)
+        if v.shape[0] > cache[gk].shape[0]:
+            cache[gk] = v
+    return cache
+
+train_feat_cache = make_feature_cache(train_df_)
+if "test_feat_cache" not in globals() or len(test_feat_cache) == 0:
+    test_feat_cache = make_feature_cache(test_df_)
+
+# align dims by padding with zeros
+D_item = max(max(len(v) for v in train_feat_cache.values()),
+             max(len(v) for v in test_feat_cache.values()))
+def pad(v, D=D_item):
+    out = np.zeros(D, dtype=np.float32)
+    v = np.asarray(v, dtype=np.float32).ravel()
+    out[:len(v)] = v
+    return out
+for k in list(train_feat_cache.keys()): train_feat_cache[k] = pad(train_feat_cache[k])
+for k in list(test_feat_cache.keys()):  test_feat_cache[k]  = pad(test_feat_cache[k])
+
+# ---- Build item table for TRAIN items we can evaluate (present in train_avg) ----
+train_items = []
+for (sn, qn), g in train_avg.groupby(["_source_norm","_query_norm"]):
+    m = (train_df_["source"].apply(norm_text) == sn) & (train_df_["question"].apply(norm_text) == qn)
+    if not m.any():
+        continue
+    r0 = train_df_[m].iloc[0]
+    gk = group_key(r0["source"], r0["question"])
+    x  = train_feat_cache.get(gk, np.zeros(D_item, dtype=np.float32))
+    train_items.append({
+        "_source_norm": sn, "_query_norm": qn,
+        "source": r0["source"], "question": r0["question"],
+        "gk": gk, "X": x
+    })
+train_items = pd.DataFrame(train_items)
+
+# ---- Train/Validation split by items (no cross-validation) ----
+uniq_keys = [(r["_source_norm"], r["_query_norm"]) for _, r in train_items.iterrows()]
+uniq_keys = list(dict.fromkeys(uniq_keys))  # preserve order, unique
+random.shuffle(uniq_keys)
+VAL_FRAC = 0.15
+n_val = max(1, int(len(uniq_keys)*VAL_FRAC))
+val_keys = set(uniq_keys[:n_val])
+train_keys = set(uniq_keys[n_val:])
+print(f"[VAL split] train_items={len(train_keys)} | val_items={len(val_keys)} | total_items={len(uniq_keys)}")
+
+# ==== NEW: materialize TRAIN subset for the training loop (85%) ====
+train_items_tr = train_items[train_items.apply(lambda r: (r["_source_norm"], r["_query_norm"]) in train_keys, axis=1)].reset_index(drop=True)
+# (optional) validation frame if you want to inspect
+# train_items_va = train_items[train_items.apply(lambda r: (r["_source_norm"], r["_query_norm"]) in val_keys, axis=1)].reset_index(drop=True)
+
+# ---- Standardization (computed on TRAIN subset ONLY) ----
+Xmat_train_items = (np.stack([row["X"] for _, row in train_items_tr.iterrows()], axis=0)
+                    if len(train_items_tr)>0 else np.zeros((1,D_item),np.float32))
+Xmu = Xmat_train_items.mean(axis=0).astype(np.float32)
+Xsd = (Xmat_train_items.std(axis=0) + 1e-6).astype(np.float32)
+def standardize(x): return (x - Xmu)/Xsd
+
+# ---- Utility: build (X, A, R) arrays for a set of item keys (for metrics) ----
+def tuples_from_keys(keys, use_cache="train"):
+    # use_cache is ignored (we use train precomp here)
+    X, A, R = [], [], []
+    for (sn, qn) in keys:
+        try:
+            g = precomp_idx_train.xs((sn, qn))
+        except KeyError:
+            continue
+        # fetch base feature
+        # pick any row from train_df_ to recover the original source/question and find gk
+        m = (train_df_["source"].apply(norm_text) == sn) & (train_df_["question"].apply(norm_text) == qn)
+        if not m.any(): continue
+        r0 = train_df_[m].iloc[0]
+        gk = group_key(r0["source"], r0["question"])
+        x  = train_feat_cache.get(gk, np.zeros(D_item, dtype=np.float32))
+        xs = standardize(x)
+        # append all logged actions for this item
+        for a_tup, row in g.iterrows():
+            a_idx = int(possible_actions.index((float(a_tup[0]), int(a_tup[1]), int(a_tup[2]))))
+            X.append(xs); A.append(a_idx); R.append(float(row["reward_1"]))
+    if len(X)==0:
+        return np.zeros((0,D_item),np.float32), np.zeros((0,),np.int64), np.zeros((0,),np.float32)
+    return np.stack(X).astype(np.float32), np.asarray(A, np.int64), np.asarray(R, np.float32)
+
+X_tr_tup, A_tr_tup, R_tr_tup = tuples_from_keys(train_keys)
+X_va_tup, A_va_tup, R_va_tup = tuples_from_keys(val_keys)
+print(f"[Tuples] TRAIN tuples={len(X_tr_tup)} | VAL tuples={len(X_va_tup)}")
+
+# ---- Static baselines to report on TEST ----
+BEST_TRAIN_STATIC = (0.7, 3, 50)  # as requested
+BEST_TEST_STATIC  = (0.5, 3, 50)  # as requested
+
+# @title
+
+# -------------------------
+# (II) TRAINING  — True contextual bandit (ε-greedy + feedback)
+# -------------------------
+
+# ---- Hyperparameters (organized & printed) ----
+HYP = dict(
+    d_in=int(D_item),
+    n_actions=int(len(possible_actions)),
+    hidden=512,
+    p_drop=0.40,
+    lr=1e-3,
+    weight_decay=1e-4,
+    epochs=25,              # training epochs
+    batch_size=128,         # mini-batch from per-action replay
+    replay_cap_per_action=5000,
+    updates_per_obs=1,      # how many SGD updates per observed (x,a,r)
+    grad_clip=1.0,
+    eps_start=0.50,         # ε-greedy (exploration) start
+    eps_end=0.05,           # ε-greedy (exploration) end
+    eps_decay_epochs=20,    # linear decay across first 20 epochs
+    device=str(device)
+)
+hp_df = pd.DataFrame([HYP])
+print("\n=== Hyperparameters ===")
+print(hp_df.to_string(index=False))
+
+# ---- A tiny model for ONE action (independent heads) ----
+class ActionMLP(nn.Module):
+    def __init__(self, d_in, hidden=512, p_drop=0.4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_in, hidden), nn.ReLU(), nn.Dropout(p_drop),
+            nn.Linear(hidden, hidden//2), nn.ReLU(), nn.Dropout(p_drop),
+            nn.Linear(hidden//2, 1)  # single reward output for this action
+        )
+    def forward(self, x):
+        return self.net(x)  # [B,1]
+
+# ---- Create 27 models (one per action) + optims ----
+models = []
+optims = []
+loss_fn = nn.MSELoss()
+for _ in range(HYP["n_actions"]):
+    m = ActionMLP(d_in=HYP["d_in"], hidden=HYP["hidden"], p_drop=HYP["p_drop"]).to(device)
+    models.append(m)
+    optims.append(torch.optim.AdamW(m.parameters(), lr=HYP["lr"], weight_decay=HYP["weight_decay"]))
+
+# ---- Simple per-action replay buffers ----
+class ReplayBuffer:
+    def __init__(self, cap):
+        self.cap = int(cap)
+        self.X = []; self.Y = []
+    def __len__(self): return len(self.Y)
+    def push(self, x, y):
+        if len(self.Y) >= self.cap:
+            self.X.pop(0); self.Y.pop(0)
+        self.X.append(x); self.Y.append(y)
+    def sample(self, batch_size):
+        if len(self.Y) == 0:
+            return None, None
+        idx = np.random.choice(len(self.Y), size=min(batch_size, len(self.Y)), replace=False)
+        Xb = np.stack([self.X[i] for i in idx]).astype(np.float32)
+        Yb = np.asarray([self.Y[i] for i in idx], dtype=np.float32).reshape(-1,1)
+        return Xb, Yb
+
+buffers = [ReplayBuffer(HYP["replay_cap_per_action"]) for _ in range(HYP["n_actions"])]
+
+# ---- epsilon schedule ----
+def epsilon_at_epoch(ep):
+    t = min(1.0, ep / max(1,HYP["eps_decay_epochs"]))
+    return HYP["eps_start"]*(1.0 - t) + HYP["eps_end"]*t
+
+# ---- Training loop (ε-greedy on logged actions, γ=0 → immediate reward) ----
+def predict_all_actions(x_std):
+    """Return 27 predicted rewards for one item feature vector."""
+    xb = torch.tensor(x_std, dtype=torch.float32, device=device).view(1,-1)
+    preds = []
+    with torch.no_grad():
+        for m in models:
+            preds.append(float(m(xb).squeeze(0).squeeze(0).detach().cpu().numpy()))
+    return np.array(preds, dtype=np.float32)
+
+for ep in range(1, HYP["epochs"]+1):
+    eps = epsilon_at_epoch(ep)
+    idx = list(range(len(train_items_tr))); random.shuffle(idx)   # ==== train on 85% only ====
+    total_updates = 0; total_loss = 0.0; skipped_no_reward = 0
+
+    for i in idx:
+        row = train_items_tr.iloc[i]
+        item_key = (row["_source_norm"], row["_query_norm"])
+        avail_actions = actions_per_item.get(item_key, [])
+        if not avail_actions:
+            continue
+
+        x_vec = row["X"].astype(np.float32)
+        xs = standardize(x_vec)  # standardized features
+
+        # exploit: use current predicted rewards; explore: pick random available
+        if random.random() < eps:
+            a_idx = possible_actions.index(random.choice(avail_actions))
+        else:
+            q_all = predict_all_actions(xs)
+            avail_idx = [possible_actions.index(a) for a in avail_actions]
+            a_idx = max(avail_idx, key=lambda j: q_all[j])
+
+        a_tup = possible_actions[a_idx]
+
+        # feedback: get logged reward for (item, action) from TRAIN aggregate
+        try:
+            row_reward = precomp_idx_train.loc[(item_key[0], item_key[1], a_tup)]
+            if isinstance(row_reward, pd.DataFrame): row_reward = row_reward.iloc[0]
+            r = float(row_reward["reward_1"])
+        except KeyError:
+            skipped_no_reward += 1
+            continue
+
+        # push to per-action replay and update that action's model
+        buffers[a_idx].push(xs, r)
+        for _ in range(HYP["updates_per_obs"]):
+            Xb, Yb = buffers[a_idx].sample(HYP["batch_size"])
+            if Xb is None:
+                continue
+            Xb = torch.tensor(Xb, dtype=torch.float32, device=device)
+            Yb = torch.tensor(Yb, dtype=torch.float32, device=device)
+            pred = models[a_idx](Xb)          # [B,1]
+            loss = loss_fn(pred, Yb)
+            optims[a_idx].zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(models[a_idx].parameters(), HYP["grad_clip"])
+            optims[a_idx].step()
+            total_updates += 1
+            total_loss += float(loss.item())
+
+    mean_loss = (total_loss/total_updates) if total_updates>0 else float("nan")
+    print(f"[Epoch {ep:02d}] eps={eps:.3f} | updates={total_updates} | mean loss={mean_loss:.6f} | skipped(no-reward)={skipped_no_reward}")
+
+# ---- Aggregate TRAIN/VAL tuple fits (use all tuples; not just replay) ----
+def predict_sa_for_tuples(X_std, A_idx):
+    """Predict q(s,a) given standardized X and integer actions A."""
+    if len(X_std)==0:
+        return np.zeros(0, dtype=np.float32)
+    y_hat = np.zeros(len(X_std), dtype=np.float32)
+    # batch predict per action for speed
+    for a in range(HYP["n_actions"]):
+        m = models[a]
+        sel = (A_idx == a)
+        if not np.any(sel):
+            continue
+        xb = torch.tensor(X_std[sel], dtype=torch.float32, device=device)
+        with torch.no_grad():
+            y_hat[sel] = m(xb).squeeze(1).detach().cpu().numpy().astype(np.float32)
+    return y_hat
+
+train_fit = regression_metrics(R_tr_tup, predict_sa_for_tuples(X_tr_tup, A_tr_tup))
+val_fit   = regression_metrics(R_va_tup, predict_sa_for_tuples(X_va_tup, A_va_tup))
+
+print("\n=== MODEL tuple fits (TRAIN / VALIDATION) ===")
+print_metrics("  TRAIN", train_fit)
+print_metrics("  VALID", val_fit)
+
+# ---- Save bundle (27 models + scaler + hyperparams) in a safe format for torch.load ----
+BUNDLE_PATH = os.path.join(RUN_DIR, "cb27_bandit_bundle.pth")
+torch.save({
+    "state_dicts": [m.state_dict() for m in models],  # tensors only
+    "d_in": HYP["d_in"],
+    "n_actions": HYP["n_actions"],
+    "hidden": HYP["hidden"],
+    "p_drop": HYP["p_drop"],
+    "Xmu": Xmu.tolist(),
+    "Xsd": Xsd.tolist(),
+    "hyperparams": HYP
+}, BUNDLE_PATH)
+print(f"[MODEL SAVED] {BUNDLE_PATH}")
+
+# @title
+
+# -------------------------
+# (III) TESTING  — reload bundle, evaluate policy & fit
+# -------------------------
+
+# ---- Reload bundle (isolate test from train) ----
+ckpt = torch.load(BUNDLE_PATH, map_location=device)  # safe: only tensors + basic types
+models_te = []
+for a in range(ckpt["n_actions"]):
+    m = ActionMLP(d_in=ckpt["d_in"], hidden=ckpt["hidden"], p_drop=ckpt["p_drop"]).to(device)
+    m.load_state_dict(ckpt["state_dicts"][a]); m.eval()
+    models_te.append(m)
+
+Xmu_te = np.array(ckpt["Xmu"], dtype=np.float32)
+Xsd_te = np.array(ckpt["Xsd"], dtype=np.float32) + 1e-6
+def standardize_test(x): return (x - Xmu_te)/Xsd_te
+
+def predict_all_actions_test(x_vec):
+    xs = standardize_test(x_vec)
+    xb = torch.tensor(xs, dtype=torch.float32, device=device).view(1,-1)
+    out = []
+    with torch.no_grad():
+        for m in models_te:
+            out.append(float(m(xb).squeeze(0).squeeze(0).detach().cpu().numpy()))
+    return np.array(out, dtype=np.float32)
+
+# ---- Helper: get one row from TEST enumerated table ----
+def get_enum_row(sn, qn, a_tup):
+    key = (float(a_tup[0]), int(a_tup[1]), int(a_tup[2]))
+    try:
+        row = precomp_idx_test.loc[(sn, qn, key)]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        return row
+    except KeyError:
+        return None
+
+# ---- Test items (unique) ----
+test_items = enum_df[["_source_norm","_query_norm","source","question"]].drop_duplicates()
+
+# ---- Evaluate policy vs statics on TEST + build per-item table ----
+test_pol, test_sta_train, test_sta_test, test_orc = [], [], [], []
+per_item_rows = []
+
+# ==== NEW: collectors for plain Test R² (policy-choice only) ====
+test_q_pred_for_choice = []   # model prediction for chosen action
+test_r_true_for_choice = []   # enumerated reward_1 for chosen action
+
+for _, r in test_items.iterrows():
+    sn, qn = r["_source_norm"], r["_query_norm"]
+    gk     = group_key(r["source"], r["question"])
+    x_vec  = test_feat_cache.get(gk, np.zeros(D_item, dtype=np.float32))
+
+    # score all 27 actions and pick the best
+    qv = predict_all_actions_test(x_vec)
+    pred_idx = int(np.argmax(qv))
+    pred_tup = possible_actions[pred_idx]
+
+    # fetch enumerated rows
+    row_pred = get_enum_row(sn, qn, pred_tup)
+    row_tr   = get_enum_row(sn, qn, BEST_TRAIN_STATIC)
+    row_te   = get_enum_row(sn, qn, BEST_TEST_STATIC)
+    if (row_pred is None) or (row_tr is None) or (row_te is None):
+        continue
+
+    r_pred = float(row_pred["reward_1"])
+    r_tr   = float(row_tr["reward_1"])
+    r_te   = float(row_te["reward_1"])
+
+    # oracle reward on full grid
+    try:
+        sub = precomp_idx_test.xs((sn, qn), level=(0,1))
+        r_orc = float(sub["reward_1"].max())
+    except KeyError:
+        continue
+
+    test_pol.append(r_pred)
+    test_sta_train.append(r_tr)
+    test_sta_test.append(r_te)
+    test_orc.append(r_orc)
+
+    # ==== NEW: store pairs for plain Test R² (policy-choice only) ====
+    test_q_pred_for_choice.append(float(qv[pred_idx]))
+    test_r_true_for_choice.append(r_pred)
+
+    # optional metric values if present
+    def get_metric(sr, name):
+        return float(pd.to_numeric(sr[name], errors="coerce")) if (name is not None and name in sr.index) else np.nan
+
+    pred_f = get_metric(row_pred, MET_F); pred_a = get_metric(row_pred, MET_A); pred_c = get_metric(row_pred, MET_C)
+    tr_f   = get_metric(row_tr,   MET_F); tr_a   = get_metric(row_tr,   MET_A); tr_c   = get_metric(row_tr,   MET_C)
+    te_f   = get_metric(row_te,   MET_F); te_a   = get_metric(row_te,   MET_A); te_c   = get_metric(row_te,   MET_C)
+
+    per_item_rows.append({
+        "source": r["source"], "question": r["question"],
+        "model_pred_action":    str(tuple(pred_tup)),
+        "model_pred_reward":    r_pred,
+        "model_pred_faithfulness": pred_f,
+        "model_pred_answer_relevance": pred_a,
+        "model_pred_context_relevance": pred_c,
+        "best_train_static_action": str(BEST_TRAIN_STATIC),
+        "best_train_static_reward": r_tr,
+        "best_train_static_faithfulness": tr_f,
+        "best_train_static_answer_relevance": tr_a,
+        "best_train_static_context_relevance": tr_c,
+        "best_test_static_action": str(BEST_TEST_STATIC),
+        "best_test_static_reward": r_te,
+        "best_test_static_faithfulness": te_f,
+        "best_test_static_answer_relevance": te_a,
+        "best_test_static_context_relevance": te_c,
+        "oracle_reward": r_orc
+    })
+
+test_pol       = np.asarray(test_pol, dtype=np.float32)
+test_sta_train = np.asarray(test_sta_train, dtype=np.float32)
+test_sta_test  = np.asarray(test_sta_test,  dtype=np.float32)
+test_orc       = np.asarray(test_orc, dtype=np.float32)
+
+# ---- Paired t-tests ----
+if len(test_pol) >= 2:
+    t_tr, p_tr = stats.ttest_rel(test_pol, test_sta_train, nan_policy="omit")
+    t_te, p_te = stats.ttest_rel(test_pol, test_sta_test,  nan_policy="omit")
+else:
+    t_tr = p_tr = t_te = p_te = np.nan
+
+print("\n=== TEST performance (enumerated policy) ===")
+print(f"[vs best TRAIN (0.7,3,50)] N={len(test_pol)} | "
+      f"policy={test_pol.mean():.4f} | static={test_sta_train.mean():.4f} | "
+      f"Δ={(test_pol - test_sta_train).mean():.4f} | "
+      f"regret={(test_orc - test_pol).mean():.4f} | t={t_tr:.3f} p={p_tr:.4g}")
+print(f"[vs best TEST  (0.5,3,50)] N={len(test_pol)} | "
+      f"policy={test_pol.mean():.4f} | static={test_sta_test.mean():.4f} | "
+      f"Δ={(test_pol - test_sta_test).mean():.4f} | "
+      f"regret={(test_orc - test_pol).mean():.4f} | t={t_te:.3f} p={p_te:.4g}")
+
+# ==== NEW: Plain Test R² (overall testing data, policy-choice only; not grid-level) ====
+test_policy_r2 = _safe_r2(test_r_true_for_choice, test_q_pred_for_choice)
+print(f"\nPlain Test R^2 (policy predictions vs enumerated rewards): {test_policy_r2:.4f}")
+
+# ---- TEST grid regression (MAE/RMSE/MSE/R² + top1@oracle) ----
+grid_true, grid_pred = [], []
+hits, N_items_top1 = 0, 0
+
+for (sn, qn), g in enum_df.groupby(["_source_norm","_query_norm"]):
+    # feature vec
+    r0 = g.iloc[0]
+    gk = group_key(r0["source"], r0["question"])
+    x_vec = test_feat_cache.get(gk, None)
+    if x_vec is None:
+        continue
+
+    # index by action for robust lookup
+    g_idx = g.set_index("_action_tuple").sort_index()
+
+    # predicted vector over 27 actions
+    preds = []
+    xs = standardize_test(x_vec)
+    with torch.no_grad():
+        xb = torch.tensor(xs, dtype=torch.float32, device=device).view(1,-1)
+        for m in models_te:
+            preds.append(float(m(xb).squeeze(0).squeeze(0).detach().cpu().numpy()))
+    pred_vec = np.array(preds, dtype=np.float32)
+
+    # collect true rewards in the same order as possible_actions
+    true_vec = []
+    ok = True
+    for a in possible_actions:
+        key = (float(a[0]), int(a[1]), int(a[2]))
+        if key not in g_idx.index:
+            ok = False; break
+        # robust access (avoid "Too many indexers")
+        val = float(g_idx.loc[[key], "reward_1"].iloc[0])
+        true_vec.append(val)
+    if not ok:
+        continue
+
+    grid_true.extend(true_vec)
+    grid_pred.extend(pred_vec.tolist())
+
+    if int(np.argmax(pred_vec)) == int(np.argmax(true_vec)):
+        hits += 1
+    N_items_top1 += 1
+
+test_grid_fit = regression_metrics(grid_true, grid_pred)
+print("\n=== TEST model metrics (enumerated grid) ===")
+print_metrics("  Test grid fit", test_grid_fit)
+if N_items_top1 > 0:
+    print(f"  Top-1 hit rate vs oracle (items): {hits}/{N_items_top1} = {hits/N_items_top1:.3f}")
+
+# ---- Save everything to ONE Excel in the run dir ----
+EXCEL_PATH = os.path.join(RUN_DIR, "cb27_bandit_results.xlsx")
+
+train_tbl = pd.DataFrame([{
+    "MSE": train_fit["mse"], "RMSE": train_fit["rmse"], "MAE": train_fit["mae"], "R2": train_fit["r2"], "N": train_fit["n"]
+}])
+val_tbl = pd.DataFrame([{
+    "MSE": val_fit["mse"], "RMSE": val_fit["rmse"], "MAE": val_fit["mae"], "R2": val_fit["r2"], "N": val_fit["n"]
+}])
+test_policy_tbl = pd.DataFrame([{
+    "N_items": int(len(test_pol)),
+    "policy_mean": float(test_pol.mean()) if len(test_pol)>0 else np.nan,
+    "static_train(0.7,3,50)_mean": float(test_sta_train.mean()) if len(test_sta_train)>0 else np.nan,
+    "static_test(0.5,3,50)_mean":  float(test_sta_test.mean())  if len(test_sta_test)>0  else np.nan,
+    "delta_vs_train_static": float((test_pol - test_sta_train).mean()) if len(test_pol)>0 else np.nan,
+    "delta_vs_test_static":  float((test_pol - test_sta_test).mean())  if len(test_pol)>0 else np.nan,
+    "regret_vs_oracle": float((test_orc - test_pol).mean()) if len(test_pol)>0 else np.nan,
+    "t_vs_train_static": float(t_tr) if t_tr==t_tr else np.nan,
+    "p_vs_train_static": float(p_tr) if p_tr==p_tr else np.nan,
+    "t_vs_test_static": float(t_te) if t_te==t_te else np.nan,
+    "p_vs_test_static": float(p_te) if p_te==p_te else np.nan
+    # (Plain Test R^2 is printed above; not altering the Excel format here)
+}])
+test_grid_tbl = pd.DataFrame([{
+    "grid_MSE": test_grid_fit["mse"], "grid_RMSE": test_grid_fit["rmse"],
+    "grid_MAE": test_grid_fit["mae"], "grid_R2": test_grid_fit["r2"], "N_pairs": test_grid_fit["n"],
+    "top1@oracle_items": (hits/N_items_top1 if N_items_top1>0 else np.nan)
+}])
+per_item_df = pd.DataFrame(per_item_rows)
+
+with pd.ExcelWriter(EXCEL_PATH, engine="xlsxwriter") as w:
+    pd.DataFrame([HYP]).to_excel(w, sheet_name="hyperparams", index=False)
+    train_tbl.to_excel(w, sheet_name="train_fit", index=False)
+    val_tbl.to_excel(w, sheet_name="val_fit", index=False)
+    test_policy_tbl.to_excel(w, sheet_name="test_policy", index=False)
+    test_grid_tbl.to_excel(w, sheet_name="test_grid", index=False)
+    per_item_df.to_excel(w, sheet_name="test_per_item", index=False)
+
+print(f"\n[EXCEL SAVED] {EXCEL_PATH}")
+print("[DONE] Check your run dir for the bundle + Excel:", RUN_DIR)
+
+
+
+
+
+
+# 12.4Δ-MoveNet (Classification via RandomForest): Predict Move Probabilities (+ STOP)
+# @title
+# ==============================================================================================
+# Δ-MoveNet (Classification via RandomForest): Predict Move Probabilities (+ STOP)
+# =============================================================================================
+# (I) SETUP   : build Δ-training from logs; prep enumerated TEST; feature caches; RUN dir
+# (II) TRAIN  : supervised classification (multi-label moves + STOP) using RF
+# (III) TEST  : same diagnostics and policy as before
+# ==============================================================================================
+
+import os, json, time
+from datetime import datetime
+import numpy as np
+import pandas as pd
+import torch  # kept for device/query only (no DNN used)
+from scipy import stats
+
+# NEW: sklearn + joblib
+from sklearn.ensemble import RandomForestClassifier
+from joblib import dump, load
+
+# -------------------------
+# (I) SETUP
+# -------------------------
+
+_need = ["possible_actions","train_df","test_df","train_log_df","test_output_df",
+         "standardize_actions_df","group_key","norm_text",
+         "build_feature_for_item","build_feature_from_row"]
+for _n in _need:
+    assert _n in globals(), f"Missing required object/function: {_n}"
+
+# --- Unique RUN dir under OUT_DIR
+OUT_DIR = OUT_DIR if "OUT_DIR" in globals() else "./runs"
+os.makedirs(OUT_DIR, exist_ok=True)
+RUN_NAME = f"delta_movenet_cls_from_best_train_static_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+RUN_DIR  = os.path.join(OUT_DIR, RUN_NAME)
+os.makedirs(RUN_DIR, exist_ok=True)
+print(f"[RUN DIR] {RUN_DIR}")
+
+# --- Device + seeds (torch only for determinism; not used in RF)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+np.random.seed(1337); torch.manual_seed(1337)
+
+# --- Grid + moves
+ALPHAS = [0.3, 0.5, 0.7]
+TOPKS  = [1, 3, 5]
+CHUNKS = [50, 100, 150]
+BASE   = (0.7, 3, 50)
+BEST_TRAIN_STATIC = (0.7, 3, 50)
+BEST_TEST_STATIC  = (0.5, 3, 50)
+
+MOVES  = ["A-","A+","K-","K+","C-","C+"]  # 6 moves
+TOPN_PER_STEP = 3
+
+def action_to_idx(t): return possible_actions.index((float(t[0]), int(t[1]), int(t[2])))
+def idx_to_action(i): return possible_actions[int(i)]
+
+def neighbor(action, move):
+    a,k,c = action
+    if move=="A-":
+        j = ALPHAS.index(a); return (ALPHAS[j-1], k, c) if j-1>=0 else None
+    if move=="A+":
+        j = ALPHAS.index(a); return (ALPHAS[j+1], k, c) if j+1<len(ALPHAS) else None
+    if move=="K-":
+        j = TOPKS.index(k);  return (a, TOPKS[j-1], c)  if j-1>=0 else None
+    if move=="K+":
+        j = TOPKS.index(k);  return (a, TOPKS[j+1], c)  if j+1<len(TOPKS) else None
+    if move=="C-":
+        j = CHUNKS.index(c); return (a, k, CHUNKS[j-1]) if j-1>=0 else None
+    if move=="C+":
+        j = CHUNKS.index(c); return (a, k, CHUNKS[j+1]) if j+1<len(CHUNKS) else None
+    return None
+
+# --- Build TEST enumerated lookup (27× grid)
+enum_df = test_output_df.copy()
+if "question" not in enum_df.columns and "query" in enum_df.columns:
+    enum_df = enum_df.rename(columns={"query":"question"})
+enum_df = standardize_actions_df(enum_df, "test_enum_df (from test_output_df)")
+print("[OK] test_enum_df (from test_output_df): actions standardized. Unique tuples:",
+      enum_df["action_tuple"].apply(lambda t: tuple(t)).nunique())
+
+# reward_1
+if "reward_1" not in enum_df.columns:
+    found=False
+    for f,a,c in [("faithfulness","answer_relevance","context_relevance"),
+                  ("faith","ans_rel","ctx_rel")]:
+        if {f,a,c}.issubset(enum_df.columns):
+            enum_df["reward_1"] = (
+                pd.to_numeric(enum_df[f], errors="coerce") +
+                pd.to_numeric(enum_df[a], errors="coerce") +
+                pd.to_numeric(enum_df[c], errors="coerce")
+            )/3.0; found=True; break
+    if not found:
+        for cand in ["reward","mean_reward","final_reward","avg_reward"]:
+            if cand in enum_df.columns:
+                enum_df["reward_1"] = pd.to_numeric(enum_df[cand], errors="coerce"); found=True; break
+    assert found, "TEST enumerated table must have reward_1 or metrics."
+
+enum_df["_source_norm"]  = enum_df["source"].apply(norm_text)
+enum_df["_query_norm"]   = enum_df["question"].apply(norm_text)
+enum_df["_action_tuple"] = enum_df["action_tuple"].apply(lambda t: (float(t[0]), int(t[1]), int(t[2])))
+
+precomp_idx_test = (enum_df
+                    .set_index(["_source_norm","_query_norm","_action_tuple"])
+                    .sort_index())
+
+# metric column ids (optional)
+def _metric_names(df):
+    cols = set(df.columns)
+    if {"faithfulness","answer_relevance","context_relevance"}.issubset(cols):
+        return ("faithfulness","answer_relevance","context_relevance")
+    if {"faith","ans_rel","ctx_rel"}.issubset(cols):
+        return ("faith","ans_rel","ctx_rel")
+    return (None, None, None)
+MET_F, MET_A, MET_C = _metric_names(enum_df)
+
+# --- TRAIN aggregate (one row per (item, action))
+tr = train_log_df.copy()
+if "question" not in tr.columns and "query" in tr.columns:
+    tr = tr.rename(columns={"query":"question"})
+tr = standardize_actions_df(tr, "train_log_df(ΔMoveNet)")
+print("[OK] train_log_df(ΔMoveNet): actions standardized. Unique tuples:",
+      tr["action_tuple"].apply(lambda t: tuple(t)).nunique())
+
+if "reward_1" not in tr.columns:
+    found=False
+    for f,a,c in [("faithfulness","answer_relevance","context_relevance"),
+                  ("faith","ans_rel","ctx_rel")]:
+        if {f,a,c}.issubset(tr.columns):
+            tr["reward_1"] = (
+                pd.to_numeric(tr[f], errors="coerce") +
+                pd.to_numeric(tr[a], errors="coerce") +
+                pd.to_numeric(tr[c], errors="coerce")
+            )/3.0; found=True; break
+    if not found:
+        for cand in ["reward","mean_reward","final_reward","avg_reward"]:
+            if cand in tr.columns:
+                tr["reward_1"] = pd.to_numeric(tr[cand], errors="coerce"); found=True; break
+    assert found, "TRAIN logs must have reward_1 or metrics."
+
+tr["_src_norm"] = tr["source"].apply(norm_text)
+tr["_qry_norm"] = tr["question"].apply(norm_text)
+tr["gk"]        = tr.apply(lambda r: group_key(r["source"], r["question"]), axis=1)
+
+# average duplicates per (item, action)
+tr_std = (tr.groupby(["gk","_src_norm","_qry_norm","action_idx"], as_index=False)["reward_1"]
+            .mean())
+
+# --- Feature caches
+def ensure_sq(df):
+    if "question" not in df.columns and "query" in df.columns:
+        df = df.rename(columns={"query":"question"})
+    if "source_content" not in df.columns:
+        df["source_content"] = ""
+    return df
+
+train_df_ = ensure_sq(train_df.copy())
+test_df_  = ensure_sq(test_df.copy())
+
+def make_feature_cache(df):
+    cache = {}
+    for _, r in df[["source","question","source_content"]].drop_duplicates().iterrows():
+        gk = group_key(r["source"], r["question"])
+        cache[gk] = build_feature_for_item(r["question"], r["source_content"])
+    for _, r in df.iterrows():
+        gk = group_key(r["source"], r["question"])
+        v  = build_feature_from_row(r)
+        if v.shape[0] > cache[gk].shape[0]:
+            cache[gk] = v
+    return cache
+
+train_feat_cache = make_feature_cache(train_df_)
+if "test_feat_cache" not in globals() or len(test_feat_cache)==0:
+    test_feat_cache = make_feature_cache(test_df_)
+
+# align dims
+D_item = max(max(len(v) for v in train_feat_cache.values()),
+             max(len(v) for v in test_feat_cache.values()))
+def _pad(v, D=D_item):
+    out = np.zeros(D, dtype=np.float32)
+    vv = np.asarray(v, dtype=np.float32).ravel()
+    out[:len(vv)] = vv
+    return out
+for k in list(train_feat_cache.keys()): train_feat_cache[k] = _pad(train_feat_cache[k])
+for k in list(test_feat_cache.keys()):  test_feat_cache[k]  = _pad(test_feat_cache[k])
+
+# --- Build Δ training arrays (X, YΔ, M); features = item + one-hot(action)
+X_rows, Y_rows, M_rows, K_rows = [], [], [], []
+move_counts = {m:0 for m in MOVES}
+
+for gk, g in tr_std.groupby("gk"):
+    x_item = train_feat_cache.get(gk, np.zeros(D_item, dtype=np.float32))
+    tab = {}
+    for _, r0 in g.iterrows():
+        a_tup = idx_to_action(int(r0["action_idx"]))
+        tab[(float(a_tup[0]), int(a_tup[1]), int(a_tup[2]))] = float(r0["reward_1"])
+    for a_tup, r_base in tab.items():
+        y = np.zeros(len(MOVES), dtype=np.float32)
+        m = np.zeros(len(MOVES), dtype=np.float32)
+        for i, mv in enumerate(MOVES):
+            nxt = neighbor(a_tup, mv)
+            if nxt is not None and nxt in tab:
+                y[i] = float(tab[nxt] - r_base); m[i]=1.0; move_counts[mv]+=1
+        if m.sum()==0: continue
+        onehot = np.zeros(len(possible_actions), dtype=np.float32)
+        onehot[action_to_idx(a_tup)] = 1.0
+        feat = np.concatenate([x_item, onehot], axis=0)
+        X_rows.append(feat); Y_rows.append(y); M_rows.append(m); K_rows.append(gk)
+
+X_tr_all = np.stack(X_rows).astype(np.float32)     # [N, D_item+27]
+Y_tr_all = np.stack(Y_rows).astype(np.float32)     # [N, 6]  deltas
+M_tr_all = np.stack(M_rows).astype(np.float32)     # [N, 6]  mask (neighbor exists)
+gk_tr    = np.array(K_rows)
+
+print(f"[ΔMoveNet-TRAIN] rows={len(X_tr_all)} | X_dim={X_tr_all.shape[1]} | " +
+      ", ".join(f"{m}={move_counts[m]}" for m in MOVES))
+
+# ---- Build classification labels ----
+Y_tr_bin = (Y_tr_all > 0.0).astype(np.float32)     # positive if delta>0
+S_tr     = (Y_tr_bin.sum(axis=1) < 0.5).astype(np.float32).reshape(-1,1)  # STOP=1 iff no positive neighbor
+
+# Per-move weights (mask-aware) are not used directly in RF; we train only where move is valid.
+
+# Also build a TRAIN enumerated lookup for reward (used later by policy if needed)
+train_avg = (tr_std.assign(_action_tuple=tr_std["action_idx"].apply(lambda i: idx_to_action(int(i))))
+               .groupby(["_src_norm","_qry_norm","_action_tuple"], as_index=False)["reward_1"].mean())
+precomp_idx_train = (train_avg
+                     .set_index(["_src_norm","_qry_norm","_action_tuple"])
+                     .sort_index())
+
+# -------------------------
+# (II) TRAINING (Classification via RF)
+# -------------------------
+
+HYP = dict(
+    rf_n_estimators=400,
+    rf_max_depth=None,
+    rf_min_samples_leaf=2,
+    rf_n_jobs=-1,
+    d_in=int(X_tr_all.shape[1]),
+    n_moves=len(MOVES)
+)
+print("\n=== Hyperparameters (classification=RF) ===")
+print(pd.DataFrame([HYP]).to_string(index=False))
+
+# RF model wrapper (6 move heads + 1 STOP head)
+class RFMoveStop:
+    def __init__(self, move_models, stop_model, mu, std):
+        self.move_models = move_models  # list of 6 RandomForestClassifier (binary) or None
+        self.stop_model  = stop_model   # RandomForestClassifier (binary)
+        self.mu = mu.astype(np.float32)
+        self.std = (std.astype(np.float32) + 1e-6)
+
+    def _std(self, X):
+        return (X - self.mu) / self.std
+
+    def predict_batch_probs(self, X):
+        """Return (P_move [N,6], P_stop [N,1]) with probabilities of class 1."""
+        Xs = self._std(X)
+        N = Xs.shape[0]
+        P_move = np.zeros((N, len(MOVES)), dtype=np.float32)
+        for j, clf in enumerate(self.move_models):
+            if clf is None:
+                continue
+            # prob of positive (class 1)
+            P = clf.predict_proba(Xs)
+            # sklearn returns [N,2], column order is classes_.index(1)
+            if clf.classes_[0] == 1:
+                pj = P[:,0]
+            else:
+                pj = P[:,1]
+            P_move[:, j] = pj.astype(np.float32)
+        # STOP head
+        P = self.stop_model.predict_proba(Xs)
+        if self.stop_model.classes_[0] == 1:
+            p_stop = P[:,0]
+        else:
+            p_stop = P[:,1]
+        return P_move, p_stop.reshape(-1,1).astype(np.float32)
+
+    def predict_one_probs(self, x):
+        X = x.reshape(1, -1)
+        Pm, Ps = self.predict_batch_probs(X)
+        return Pm[0], float(Ps[0,0])
+
+def train_classifier_rf(X, Y_bin, M, S, cfg):
+    mu = X.mean(axis=0); std = X.std(axis=0) + 1e-6  # keep scaler for consistency
+    Xs = (X - mu) / std
+
+    move_models = []
+    for j in range(len(MOVES)):
+        sel = (M[:,j] > 0.5)
+        if not np.any(sel):
+            move_models.append(None); continue
+        Xj = Xs[sel]
+        yj = Y_bin[sel, j].astype(int).ravel()
+        rf = RandomForestClassifier(
+            n_estimators=int(cfg["rf_n_estimators"]),
+            max_depth=(None if cfg["rf_max_depth"] in [None,"None"] else int(cfg["rf_max_depth"])),
+            min_samples_leaf=int(cfg["rf_min_samples_leaf"]),
+            n_jobs=int(cfg["rf_n_jobs"]),
+            class_weight="balanced",
+            random_state=1337
+        )
+        rf.fit(Xj, yj)
+        move_models.append(rf)
+
+    # STOP head on all rows
+    y_stop = S.astype(int).ravel()
+    rf_stop = RandomForestClassifier(
+        n_estimators=int(cfg["rf_n_estimators"]),
+        max_depth=(None if cfg["rf_max_depth"] in [None,"None"] else int(cfg["rf_max_depth"])),
+        min_samples_leaf=int(cfg["rf_min_samples_leaf"]),
+        n_jobs=int(cfg["rf_n_jobs"]),
+        class_weight="balanced",
+        random_state=1337
+    )
+    rf_stop.fit(Xs, y_stop)
+
+    model = RFMoveStop(move_models, rf_stop, mu, std)
+    return model, (mu, std)
+
+# Train RF classifier
+model_mv, scaler_mv = train_classifier_rf(X_tr_all, Y_tr_bin, M_tr_all, S_tr, HYP)
+
+# ---- Save RF bundle (joblib) ----
+MODEL_PATH = os.path.join(RUN_DIR, "moveprobnet_model_rf.pkl")
+dump({
+    "move_models": model_mv.move_models,
+    "stop_model":  model_mv.stop_model,
+    "mu": scaler_mv[0].astype(np.float32),
+    "std": scaler_mv[1].astype(np.float32),
+    "moves_order": MOVES
+}, MODEL_PATH)
+print(f"[MODEL SAVED] {MODEL_PATH}")
+
+# -------------------------
+# (III) TESTING (Classification metrics + policy)
+# -------------------------
+
+# Helper: predict probabilities (works for RF and, if needed, legacy NN)
+def predict_probs(model, scaler, x_item, action_idx):
+    """Return (p_move[6], p_stop) for a single (item, action)."""
+    # Build feature (item ⊕ one-hot(action))
+    onehot = np.zeros(len(possible_actions), dtype=np.float32)
+    onehot[int(action_idx)] = 1.0
+    feat = np.concatenate([x_item.astype(np.float32), onehot], 0)
+    # RF path
+    if hasattr(model, "predict_one_probs"):
+        p_move, p_stop = model.predict_one_probs(feat)
+        return p_move.astype(np.float32), float(p_stop)
+    # (Fallback NN path; not used here)
+    mu,std = scaler
+    xs = (feat - mu) / std
+    xb = torch.tensor(xs, dtype=torch.float32, device=device).view(1,-1)
+    logits_move, logit_stop = model(xb)
+    p_move = torch.sigmoid(logits_move).squeeze(0).detach().cpu().numpy()
+    p_stop = torch.sigmoid(logit_stop).item()
+    return p_move, p_stop
+
+# Build TEST Δ arrays for classification labels
+X_te, Y_te, M_te, S_te = [], [], [], []
+for (sn, qn), g in enum_df.groupby(["_source_norm","_query_norm"]):
+    r0 = g.iloc[0]
+    gk = group_key(r0["source"], r0["question"])
+    x_item = test_feat_cache.get(gk, np.zeros(D_item, dtype=np.float32))
+
+    # table action->reward
+    tab = {}
+    for _, rr in g.iterrows():
+        t = (float(rr["alpha"]), int(rr["top_k"]), int(rr["chunk"]))
+        tab[t] = float(rr["reward_1"])
+
+    for a_tup in possible_actions:
+        if a_tup not in tab: continue
+        y = np.zeros(len(MOVES), dtype=np.float32)
+        m = np.zeros(len(MOVES), dtype=np.float32)
+        for i, mv in enumerate(MOVES):
+            nxt = neighbor(a_tup, mv)
+            if nxt is not None and nxt in tab:
+                y[i] = tab[nxt] - tab[a_tup]
+                m[i] = 1.0
+        if m.sum()==0: continue
+        onehot = np.zeros(len(possible_actions), dtype=np.float32)
+        onehot[action_to_idx(a_tup)] = 1.0
+        feat = np.concatenate([x_item, onehot], 0)
+        X_te.append(feat); Y_te.append(y); M_te.append(m)
+        S_te.append(1.0 if (y[m>0] <= 0.0).all() else 0.0)
+
+if len(X_te)>0:
+    X_te = np.stack(X_te).astype(np.float32)
+    Y_te = np.stack(Y_te).astype(np.float32)
+    M_te = np.stack(M_te).astype(np.float32)
+    S_te = np.array(S_te, dtype=np.float32).reshape(-1,1)
+else:
+    print("[WARN] No TEST Δ rows could be built.]")
+
+# ---- Classification metrics
+def _safe_div(a,b): return (a/(b+1e-9))
+
+def binary_prf1(y_true, y_pred):
+    tp = float(((y_true==1)&(y_pred==1)).sum())
+    fp = float(((y_true==0)&(y_pred==1)).sum())
+    fn = float(((y_true==1)&(y_pred==0)).sum())
+    tn = float(((y_true==0)&(y_pred==0)).sum())
+    prec = _safe_div(tp, tp+fp)
+    rec  = _safe_div(tp, tp+fn)
+    f1   = _safe_div(2*prec*rec, (prec+rec))
+    acc  = _safe_div(tp+tn, tp+tn+fp+fn)
+    return dict(acc=acc, precision=prec, recall=rec, f1=f1,
+                tp=tp, fp=fp, fn=fn, tn=tn)
+
+def multiclass_macro_f1(y_true, y_pred, C):
+    f1s=[]; precs=[]; recs=[]
+    for c in range(C):
+        yt = (y_true==c).astype(int)
+        yp = (y_pred==c).astype(int)
+        m = binary_prf1(yt, yp)
+        if (yt.sum()+ (yt==0).sum())>0:
+            f1s.append(m["f1"]); precs.append(m["precision"]); recs.append(m["recall"])
+    return dict(macro_f1=float(np.mean(f1s) if f1s else np.nan),
+                macro_precision=float(np.mean(precs) if precs else np.nan),
+                macro_recall=float(np.mean(recs) if recs else np.nan))
+
+def multilabel_f1(y_true_bin, y_pred_bin, mask):
+    y_true_flat = (y_true_bin[mask>0.5]).astype(int)
+    y_pred_flat = (y_pred_bin[mask>0.5]).astype(int)
+    if y_true_flat.size == 0:
+        return dict(micro_f1=np.nan, macro_f1=np.nan)
+    tp = ((y_true_flat==1)&(y_pred_flat==1)).sum()
+    fp = ((y_true_flat==0)&(y_pred_flat==1)).sum()
+    fn = ((y_true_flat==1)&(y_pred_flat==0)).sum()
+    prec = _safe_div(tp, tp+fp); rec = _safe_div(tp, tp+fn)
+    micro_f1 = _safe_div(2*prec*rec, (prec+rec))
+    f1s=[]
+    for j in range(y_true_bin.shape[1]):
+        mt = mask[:,j]>0.5
+        if not mt.any():
+            continue
+        yt = y_true_bin[mt,j].astype(int)
+        yp = y_pred_bin[mt,j].astype(int)
+        m  = binary_prf1(yt, yp)
+        f1s.append(m["f1"])
+    macro_f1 = float(np.mean(f1s) if f1s else np.nan)
+    return dict(micro_f1=float(micro_f1), macro_f1=macro_f1)
+
+def eval_classification_block(model, scaler, X, Y_delta, M, S, split_name=""):
+    # Build probabilities for moves+stop from RF
+    if hasattr(model, "predict_batch_probs"):
+        P_move, P_stop = model.predict_batch_probs(X)
+    else:
+        # legacy NN path (not used in RF version)
+        mu, std = scaler
+        Xs = (X - mu) / std
+        N = X.shape[0]
+        P_move = np.zeros((N, len(MOVES)), dtype=np.float32)
+        P_stop = np.zeros((N, 1), dtype=np.float32)
+        bs = 4096
+        with torch.no_grad():
+            for i in range(0, N, bs):
+                xb = torch.tensor(Xs[i:i+bs], dtype=torch.float32, device=device)
+                logits_move, logit_stop = model(xb)
+                P_move[i:i+bs] = torch.sigmoid(logits_move).cpu().numpy()
+                P_stop[i:i+bs,:] = torch.sigmoid(logit_stop).cpu().numpy()
+
+    # Move vs STOP (binary) — positive class = MOVE
+    true_move = ( (Y_delta > 0) & (M>0) ).any(axis=1).astype(int)
+    pred_move = (P_stop.ravel() < 0.5).astype(int)
+    mv_stop = binary_prf1(true_move, pred_move)
+
+    # Which move? Only on rows where true_move=1
+    has_pos = true_move==1
+    y_true_best = np.argmax(np.where(M[has_pos]>0, Y_delta[has_pos], -1e9), axis=1)
+    p_move_masked = np.where(M>0, P_move, -1e9)
+    y_pred_best = np.argmax(p_move_masked[has_pos], axis=1)
+
+    top1_acc = float(np.mean((y_true_best==y_pred_best).astype(np.float32))) if has_pos.any() else np.nan
+    which_f1 = multiclass_macro_f1(y_true_best, y_pred_best, C=len(MOVES)) if has_pos.any() else dict(macro_f1=np.nan, macro_precision=np.nan, macro_recall=np.nan)
+
+    # Multi-label F1 across moves (threshold 0.5) on valid neighbors
+    Y_bin = (Y_delta > 0).astype(int)
+    Y_hat_bin = (P_move >= 0.5).astype(int)
+    ml = multilabel_f1(Y_bin, Y_hat_bin, M)
+
+    out = dict(
+        split=split_name,
+        move_stop_acc=mv_stop["acc"], move_stop_precision=mv_stop["precision"],
+        move_stop_recall=mv_stop["recall"], move_stop_f1=mv_stop["f1"],
+        which_top1_acc=top1_acc, which_macro_f1=which_f1["macro_f1"],
+        which_macro_precision=which_f1["macro_precision"], which_macro_recall=which_f1["macro_recall"],
+        multilabel_micro_f1=ml["micro_f1"], multilabel_macro_f1=ml["macro_f1"]
+    )
+    return out, P_move, P_stop
+
+# TRAIN metrics
+train_cls, _, _ = eval_classification_block(model_mv, scaler_mv, X_tr_all, Y_tr_all, M_tr_all, S_tr, "train")
+print("\n=== TRAIN classification metrics ===")
+for k,v in train_cls.items():
+    if k!="split": print(f"  {k}: {v:.4f}")
+
+# Reload RF bundle for TEST
+rf_ckpt = load(MODEL_PATH)
+model_te = RFMoveStop(
+    move_models=rf_ckpt["move_models"],
+    stop_model=rf_ckpt["stop_model"],
+    mu=rf_ckpt["mu"],
+    std=rf_ckpt["std"]
+)
+scaler_te = (rf_ckpt["mu"], rf_ckpt["std"])
+
+test_cls, Pm_te, Ps_te = eval_classification_block(model_te, scaler_te, X_te, Y_te, M_te, S_te, "test")
+print("\n=== TEST classification metrics ===")
+for k,v in test_cls.items():
+    if k!="split": print(f"  {k}: {v:.4f}")
+
+# --- Policy eval (TEST) using move probabilities + τ gate (unchanged)
+def r_of_group(g, a,k,c):
+    row = g[(g["alpha"]==float(a)) & (g["top_k"]==int(k)) & (g["chunk"]==int(c))]
+    return (float(row["reward_1"].iloc[0]) if len(row)>0 else None)
+
+BUDGET_LIST = [1,2,3]
+TAUS        = [0.45, 0.50, 0.55, 0.60]  # probability gate for accepting a move
+
+def eval_with_budget_and_tau_cls(budget, tau, return_items=False):
+    base_rewards, pol_rewards, orc_rewards = [], [], []
+    steps_taken = []
+    item_rows = []
+    move_hist = {m:0 for m in MOVES}
+
+    test_items = enum_df[["source","question","_source_norm","_query_norm"]].drop_duplicates()
+    for it in test_items.itertuples(index=False):
+        src, qry, sn, qn = it[0], it[1], it[2], it[3]
+        gk  = group_key(src, qry)
+        x_it = test_feat_cache.get(gk, np.zeros(D_item, dtype=np.float32))
+        g    = enum_df[(enum_df["_source_norm"]==sn) & (enum_df["_query_norm"]==qn)]
+
+        r_b = r_of_group(g, *BASE)
+        if r_b is None: continue
+        base_rewards.append(r_b)
+        orc = float(g["reward_1"].max()); orc_rewards.append(orc)
+
+        action = BASE; r_best = r_b; took=0; seq=[]
+        for _ in range(budget):
+            a_idx = action_to_idx(action)
+            p_move, p_stop = predict_probs(model_te, scaler_te, x_it, a_idx)
+
+            cand = []
+            for i, mv in enumerate(MOVES):
+                nxt = neighbor(action, mv)
+                if nxt is None: continue
+                r1 = r_of_group(g, *nxt)
+                if r1 is None: continue
+                cand.append((i,mv,nxt,p_move[i],r1))
+            if not cand: break
+
+            cand.sort(key=lambda t: -t[3])  # by predicted probability
+            accepted=False
+            for (i_mv, mv, nxt, p, r1) in cand[:TOPN_PER_STEP]:
+                if p < tau - 1e-12: continue
+                if r1 <= r_best + 1e-9: continue
+                action = nxt; r_best = r1; took+=1; seq.append(mv); move_hist[mv]+=1
+                accepted=True; break
+            if not accepted: break
+
+        pol_rewards.append(r_best)
+        steps_taken.append(took)
+
+        if return_items:
+            # predicted row + statics for reporting
+            def _get_row(a_tup):
+                key = (float(a_tup[0]),int(a_tup[1]),int(a_tup[2]))
+                try:
+                    sub = precomp_idx_test.xs((sn,qn), level=(0,1))
+                    if key not in sub.index: return None
+                    return sub.loc[[key]].iloc[0]
+                except Exception:
+                    return None
+            row_pred = _get_row(action)
+            row_tr   = _get_row(BEST_TRAIN_STATIC)
+            row_te   = _get_row(BEST_TEST_STATIC)
+            def _get(sr, name):
+                return (float(pd.to_numeric(sr[name], errors="coerce"))
+                        if (sr is not None and name is not None and name in sr.index) else np.nan)
+            pred_f = _get(row_pred, MET_F); pred_a = _get(row_pred, MET_A); pred_c = _get(row_pred, MET_C)
+            tr_f   = _get(row_tr,   MET_F); tr_a   = _get(row_tr,   MET_A); tr_c   = _get(row_tr,   MET_C)
+            te_f   = _get(row_te,   MET_F); te_a   = _get(row_te,   MET_A); te_c   = _get(row_te,   MET_C)
+            r_tr = float(row_tr["reward_1"]) if row_tr is not None else np.nan
+            r_te = float(row_te["reward_1"]) if row_te is not None else np.nan
+
+            item_rows.append({
+                "source": src, "question": qry,
+                "base_action": str(BASE), "base_reward": r_b,
+                "final_action": str(tuple(action)), "final_reward": r_best,
+                "best_train_static_action": str(BEST_TRAIN_STATIC), "best_train_static_reward": r_tr,
+                "best_test_static_action":  str(BEST_TEST_STATIC),  "best_test_static_reward":  r_te,
+                "model_pred_faithfulness": pred_f,
+                "model_pred_answer_relevance": pred_a,
+                "model_pred_context_relevance": pred_c,
+                "oracle_reward": orc,
+                "improvement_over_base": r_best - r_b,
+                "steps_taken": took,
+                "tau_prob": tau,
+                "moves": " > ".join(seq)
+            })
+
+    t_stat, p_val = (stats.ttest_rel(pol_rewards, base_rewards, nan_policy="omit")
+                     if len(pol_rewards)==len(base_rewards) and len(pol_rewards)>1 else (np.nan, np.nan))
+    out = {
+        "budget": budget, "tau_prob": tau, "n_items": len(pol_rewards),
+        "base": float(np.mean(base_rewards)) if base_rewards else np.nan,
+        "policy": float(np.mean(pol_rewards)) if pol_rewards else np.nan,
+        "oracle": float(np.mean(orc_rewards)) if orc_rewards else np.nan,
+        "gain": (np.mean(pol_rewards)-np.mean(base_rewards)) if pol_rewards else np.nan,
+        "regret": (np.mean(orc_rewards)-np.mean(pol_rewards)) if pol_rewards else np.nan,
+        "avg_steps": float(np.mean(steps_taken)) if steps_taken else 0.0,
+        "t_stat": float(t_stat) if t_stat==t_stat else np.nan,
+        "p_value": float(p_val) if p_val==p_val else np.nan
+    }
+    if return_items:
+        out["items"] = item_rows
+    return out
+
+# Sweep budgets/taus
+all_runs = []
+per_budget_best = []
+for BUDGET in BUDGET_LIST:
+    runs = [eval_with_budget_and_tau_cls(BUDGET, tau) for tau in TAUS]
+    dfb  = pd.DataFrame(runs).sort_values("policy", ascending=False)
+    best = dfb.iloc[0]; best_tau = float(best["tau_prob"])
+    best_run = eval_with_budget_and_tau_cls(BUDGET, best_tau, return_items=True)
+    print(f"\n[Budget {BUDGET} | POLICY=classifier] best τ_p={best_tau:.2f} | "
+          f"policy={best['policy']:.4f} | base={best['base']:.4f} | gain={best['gain']:.4f} | "
+          f"regret={best['regret']:.4f} | p={best['p_value']:.5g}")
+    per_budget_best.append({"budget": BUDGET, "tau_prob": best_tau, "summary": best, "items": best_run["items"]})
+    all_runs.extend(runs)
+
+# Paired t-tests vs BOTH statics for each budget's best τ
+paired_all_budgets = []
+for pb in per_budget_best:
+    items_df = pd.DataFrame(pb["items"])
+    if len(items_df) < 2:
+        paired_all_budgets.append({"budget": pb["budget"], "N": len(items_df),
+                                   "test_t": np.nan, "test_p": np.nan,
+                                   "train_t": np.nan, "train_p": np.nan})
+        continue
+    pol = items_df["final_reward"].astype(float).to_numpy()
+    sta_test  = items_df["best_test_static_reward"].astype(float).to_numpy()
+    sta_train = items_df["best_train_static_reward"].astype(float).to_numpy()
+    t_te, p_te = stats.ttest_rel(pol, sta_test,  nan_policy="omit")
+    t_tr, p_tr = stats.ttest_rel(pol, sta_train, nan_policy="omit")
+    paired_all_budgets.append({
+        "budget": pb["budget"], "N": len(pol),
+        "policy_mean": float(np.mean(pol)),
+        "static_test_mean": float(np.mean(sta_test)),
+        "static_train_mean": float(np.mean(sta_train)),
+        "delta_vs_test": float(np.mean(pol-sta_test)),
+        "delta_vs_train": float(np.mean(pol-sta_train)),
+        "test_t": float(t_te), "test_p": float(p_te),
+        "train_t": float(t_tr), "train_p": float(p_tr)
+    })
+
+# -------------------------
+# Save everything to ONE Excel in RUN_DIR (same as original)
+# -------------------------
+EXCEL_PATH = os.path.join(RUN_DIR, "deltamovenet_cls_results.xlsx")
+
+hp_tbl  = pd.DataFrame([HYP])
+train_cls_tbl = pd.DataFrame([train_cls])
+test_cls_tbl  = pd.DataFrame([test_cls])
+
+summ_rows = []
+for pb in per_budget_best:
+    s = pb["summary"]
+    summ_rows.append({
+        "budget": pb["budget"], "tau_prob": float(pb["tau_prob"]),
+        "N_items": int(s["n_items"]),
+        "policy_mean": float(s["policy"]),
+        "base_mean": float(s["base"]),
+        "oracle_mean": float(s["oracle"]),
+        "gain": float(s["gain"]),
+        "regret": float(s["regret"]),
+        "avg_steps": float(s["avg_steps"]),
+        "t_vs_base": float(s["t_stat"]), "p_vs_base": float(s["p_value"])
+    })
+best_tbl = pd.DataFrame(summ_rows)
+df_all = pd.DataFrame(all_runs).sort_values(["budget","policy"], ascending=[True,False])
+paired_tbl = pd.DataFrame(paired_all_budgets)
+
+def _items_by_budget(per_budget_best):
+    out = {}
+    for pb in per_budget_best:
+        b = int(pb["budget"])
+        df = pd.DataFrame(pb["items"]).copy()
+        if len(df) == 0:
+            continue
+        df["tau_prob"] = float(pb["tau_prob"])
+        out[b] = df
+    return out
+
+_items_map = _items_by_budget(per_budget_best)
+per_item_df_b1 = _items_map.get(1, pd.DataFrame())
+per_item_df_b2 = _items_map.get(2, pd.DataFrame())
+per_item_df_b3 = _items_map.get(3, pd.DataFrame())
+
+def _suffix_and_keep(df, budget):
+    core = ["source","question","base_reward","final_action","final_reward",
+            "improvement_over_base","steps_taken","moves","tau_prob"]
+    for c in core:
+        if c not in df.columns: df[c] = np.nan
+    sub = df[core].copy()
+    sub = sub.rename(columns={c: (f"{c}_b{budget}" if c not in ["source","question"] else c)
+                              for c in sub.columns})
+    return sub
+
+per_item_by_budget_df = pd.DataFrame()
+if len(_items_map) > 0:
+    merged = None
+    for b in sorted(_items_map.keys()):
+        sub = _suffix_and_keep(_items_map[b], b)
+        merged = sub if merged is None else merged.merge(sub, on=["source","question"], how="outer")
+    per_item_by_budget_df = merged if merged is not None else pd.DataFrame()
+
+with pd.ExcelWriter(EXCEL_PATH, engine="xlsxwriter") as w:
+    hp_tbl.to_excel(w, sheet_name="hyperparams_classify", index=False)
+    train_cls_tbl.to_excel(w, sheet_name="train_cls_metrics", index=False)
+    test_cls_tbl.to_excel(w, sheet_name="test_cls_metrics", index=False)
+    best_tbl.to_excel(w, sheet_name="best_policy_per_budget", index=False)
+    df_all.to_excel(w, sheet_name="all_tau_grid", index=False)
+    paired_tbl.to_excel(w, sheet_name="paired_tests_all_budgets", index=False)
+
+    if len(per_item_df_b1) > 0:
+        per_item_df_b1.to_excel(w, sheet_name="test_per_item_budget1", index=False)
+    if len(per_item_df_b2) > 0:
+        per_item_df_b2.to_excel(w, sheet_name="test_per_item_budget2", index=False)
+    if len(per_item_df_b3) > 0:
+        per_item_df_b3.to_excel(w, sheet_name="test_per_item_budget3", index=False)
+
+    if len(per_item_by_budget_df) > 0:
+        fixed = ["source","question"]
+        dynamic = [c for c in per_item_by_budget_df.columns if c not in fixed]
+        def _order_key(c):
+            if c.endswith("_b1"): return (1, c)
+            if c.endswith("_b2"): return (2, c)
+            if c.endswith("_b3"): return (3, c)
+            return (9, c)
+        dynamic_sorted = sorted(dynamic, key=_order_key)
+        per_item_by_budget_df[fixed + dynamic_sorted].to_excel(
+            w, sheet_name="test_per_item_by_budget", index=False
+        )
+
+print(f"\n[EXCEL SAVED] {EXCEL_PATH}")
+print("[DONE] Check the run directory for classification model + Excel:", RUN_DIR)
+
+# 13. Δ-MoveNet (Classification + Hybrid LinUCB): online updates on VALIDATION only --- from best train static
+# @title
+# =========================================================================================================================
+# Δ-MoveNet (Classification + Hybrid LinUCB): online updates on VALIDATION only (never on TEST)--- from best train static
+# =========================================================================================================================
+# (I) SETUP   : build Δ-training from logs; prep enumerated TEST; feature caches; RUN dir
+# (II) TRAIN  : supervised classification (multi-label moves + STOP)  <-- RF swap here
+# (III) HYBRID: LinUCB head prewarm from train Δ, choose τ on VAL (no updates),
+#               do one online update pass on VAL (budget=3), freeze, TEST w/ no updates
+#               budgeted greedy local search (probability gate τ); paired t-tests
+#               Excel with hyperparams, metrics, policies, per-item (B=1/2/3 + side-by-side)
+# ---------------------------------------------------------------
+
+import os, json, time
+from datetime import datetime
+import numpy as np
+import pandas as pd
+import torch
+from scipy import stats
+
+# NEW: RandomForest + joblib for the classifier swap
+from sklearn.ensemble import RandomForestClassifier
+from joblib import dump, load
+
+# -------------------------
+# (I) SETUP
+# -------------------------
+
+_need = ["possible_actions","train_df","test_df","train_log_df","test_output_df",
+         "standardize_actions_df","group_key","norm_text",
+         "build_feature_for_item","build_feature_from_row"]
+for _n in _need:
+    assert _n in globals(), f"Missing required object/function: {_n}"
+
+# --- Unique RUN dir under OUT_DIR
+OUT_DIR = OUT_DIR if "OUT_DIR" in globals() else "./runs"
+os.makedirs(OUT_DIR, exist_ok=True)
+RUN_NAME = f"delta_movenet_cls_from_best_test_static_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+RUN_DIR  = os.path.join(OUT_DIR, RUN_NAME)
+os.makedirs(RUN_DIR, exist_ok=True)
+print(f"[RUN DIR] {RUN_DIR}")
+
+# --- Device + seeds
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+np.random.seed(1337); torch.manual_seed(1337)
+
+# --- Grid + moves
+ALPHAS = [0.3, 0.5, 0.7]
+TOPKS  = [1, 3, 5]
+CHUNKS = [50, 100, 150]
+BASE   = (0.7, 3, 50)
+BEST_TRAIN_STATIC = (0.7, 3, 50)
+BEST_TEST_STATIC  = (0.5, 3, 50)
+
+MOVES  = ["A-","A+","K-","K+","C-","C+"]  # 6 moves
+TOPN_PER_STEP = 3
+
+# [FIX] Normalize possible_actions to consistent (float,int,int)
+possible_actions = [(float(a), int(k), int(c)) for (a, k, c) in possible_actions]
+
+def action_to_idx(t): return possible_actions.index((float(t[0]), int(t[1]), int(t[2])))
+def idx_to_action(i): return possible_actions[int(i)]
+
+def neighbor(action, move):
+    a,k,c = action
+    if move=="A-":
+        j = ALPHAS.index(a); return (ALPHAS[j-1], k, c) if j-1>=0 else None
+    if move=="A+":
+        j = ALPHAS.index(a); return (ALPHAS[j+1], k, c) if j+1<len(ALPHAS) else None
+    if move=="K-":
+        j = TOPKS.index(k);  return (a, TOPKS[j-1], c)  if j-1>=0 else None
+    if move=="K+":
+        j = TOPKS.index(k);  return (a, TOPKS[j+1], c)  if j+1<len(TOPKS) else None
+    if move=="C-":
+        j = CHUNKS.index(c); return (a, k, CHUNKS[j-1]) if j-1>=0 else None
+    if move=="C+":
+        j = CHUNKS.index(c); return (a, k, CHUNKS[j+1]) if j+1<len(CHUNKS) else None
+    return None
+
+# --- Build TEST enumerated lookup (27× grid)
+enum_df = test_output_df.copy()
+if "question" not in enum_df.columns and "query" in enum_df.columns:
+    enum_df = enum_df.rename(columns={"query":"question"})
+enum_df = standardize_actions_df(enum_df, "test_enum_df (from test_output_df)")
+print("[OK] test_enum_df (from test_output_df): actions standardized. Unique tuples:",
+      enum_df["action_tuple"].apply(lambda t: tuple(t)).nunique())
+
+if "reward_1" not in enum_df.columns:
+    found=False
+    for f,a,c in [("faithfulness","answer_relevance","context_relevance"),
+                  ("faith","ans_rel","ctx_rel")]:
+        if {f,a,c}.issubset(enum_df.columns):
+            enum_df["reward_1"] = (
+                pd.to_numeric(enum_df[f], errors="coerce") +
+                pd.to_numeric(enum_df[a], errors="coerce") +
+                pd.to_numeric(enum_df[c], errors="coerce")
+            )/3.0; found=True; break
+    if not found:
+        for cand in ["reward","mean_reward","final_reward","avg_reward"]:
+            if cand in enum_df.columns:
+                enum_df["reward_1"] = pd.to_numeric(enum_df[cand], errors="coerce"); found=True; break
+    assert found, "TEST enumerated table must have reward_1 or metrics."
+
+enum_df["_source_norm"]  = enum_df["source"].apply(norm_text)
+enum_df["_query_norm"]   = enum_df["question"].apply(norm_text)
+enum_df["_action_tuple"] = enum_df["action_tuple"].apply(lambda t: (float(t[0]), int(t[1]), int(t[2])))
+
+precomp_idx_test_full = (enum_df
+                    .set_index(["_source_norm","_query_norm","_action_tuple"])
+                    .sort_index())
+
+def _metric_names(df):
+    cols = set(df.columns)
+    if {"faithfulness","answer_relevance","context_relevance"}.issubset(cols):
+        return ("faithfulness","answer_relevance","context_relevance")
+    if {"faith","ans_rel","ctx_rel"}.issubset(cols):
+        return ("faith","ans_rel","ctx_rel")
+    return (None, None, None)
+MET_F, MET_A, MET_C = _metric_names(enum_df)
+
+# --- TRAIN aggregate (one row per (item, action))
+tr = train_log_df.copy()
+if "question" not in tr.columns and "query" in tr.columns:
+    tr = tr.rename(columns={"query":"question"})
+tr = standardize_actions_df(tr, "train_log_df(ΔMoveNet)")
+print("[OK] train_log_df(ΔMoveNet): actions standardized. Unique tuples:",
+      tr["action_tuple"].apply(lambda t: tuple(t)).nunique())
+
+if "reward_1" not in tr.columns:
+    found=False
+    for f,a,c in [("faithfulness","answer_relevance","context_relevance"),
+                  ("faith","ans_rel","ctx_rel")]:
+        if {f,a,c}.issubset(tr.columns):
+            tr["reward_1"] = (
+                pd.to_numeric(tr[f], errors="coerce") +
+                pd.to_numeric(tr[a], errors="coerce") +
+                pd.to_numeric(tr[c], errors="coerce")
+            )/3.0; found=True; break
+    if not found:
+        for cand in ["reward","mean_reward","final_reward","avg_reward"]:
+            if cand in tr.columns:
+                tr["reward_1"] = pd.to_numeric(tr[cand], errors="coerce"); found=True; break
+    assert found, "TRAIN logs must have reward_1 or metrics."
+
+tr["_src_norm"] = tr["source"].apply(norm_text)
+tr["_qry_norm"] = tr["question"].apply(norm_text)
+tr["gk"]        = tr.apply(lambda r: group_key(r["source"], r["question"]), axis=1)
+
+# average duplicates per (item, action)
+tr_std = (tr.groupby(["gk","_src_norm","_qry_norm","action_idx"], as_index=False)["reward_1"]
+            .mean())
+
+# --- Feature caches
+def ensure_sq(df):
+    if "question" not in df.columns and "query" in df.columns:
+        df = df.rename(columns={"query":"question"})
+    if "source_content" not in df.columns:
+        df["source_content"] = ""
+    return df
+
+train_df_ = ensure_sq(train_df.copy())
+test_df_  = ensure_sq(test_df.copy())
+
+def make_feature_cache(df):
+    cache = {}
+    for _, r in df[["source","question","source_content"]].drop_duplicates().iterrows():
+        gk = group_key(r["source"], r["question"])
+        cache[gk] = build_feature_for_item(r["question"], r["source_content"])
+    for _, r in df.iterrows():
+        gk = group_key(r["source"], r["question"])
+        v  = build_feature_from_row(r)
+        if v.shape[0] > cache[gk].shape[0]:
+            cache[gk] = v
+    return cache
+
+train_feat_cache = make_feature_cache(train_df_)
+if "test_feat_cache" not in globals() or len(test_feat_cache)==0:
+    test_feat_cache = make_feature_cache(test_df_)
+
+# align dims
+D_item = max(max(len(v) for v in train_feat_cache.values()),
+             max(len(v) for v in test_feat_cache.values()))
+def _pad(v, D=D_item):
+    out = np.zeros(D, dtype=np.float32)
+    vv = np.asarray(v, dtype=np.float32).ravel()
+    out[:len(vv)] = vv
+    return out
+for k in list(train_feat_cache.keys()): train_feat_cache[k] = _pad(train_feat_cache[k])
+for k in list(test_feat_cache.keys()):  test_feat_cache[k]  = _pad(test_feat_cache[k])
+
+# --- Build Δ training arrays (X, YΔ, M); features = item + one-hot(action)
+X_rows, Y_rows, M_rows, K_rows = [], [], [], []
+move_counts = {m:0 for m in MOVES}
+
+for gk, g in tr_std.groupby("gk"):
+    x_item = train_feat_cache.get(gk, np.zeros(D_item, dtype=np.float32))
+    tab = {}
+    for _, r0 in g.iterrows():
+        a_tup = idx_to_action(int(r0["action_idx"]))
+        tab[(float(a_tup[0]), int(a_tup[1]), int(a_tup[2]))] = float(r0["reward_1"])
+    for a_tup, r_base in tab.items():
+        y = np.zeros(len(MOVES), dtype=np.float32)
+        m = np.zeros(len(MOVES), dtype=np.float32)
+        for i, mv in enumerate(MOVES):
+            nxt = neighbor(a_tup, mv)
+            if nxt is not None and nxt in tab:
+                y[i] = float(tab[nxt] - r_base); m[i]=1.0; move_counts[mv]+=1
+        if m.sum()==0: continue
+        onehot = np.zeros(len(possible_actions), dtype=np.float32)
+        onehot[action_to_idx(a_tup)] = 1.0
+        feat = np.concatenate([x_item, onehot], axis=0)
+        X_rows.append(feat); Y_rows.append(y); M_rows.append(m); K_rows.append(gk)
+
+# [FIX] Guard for empty Δ-training rows
+if len(X_rows) == 0:
+    raise RuntimeError(
+        "[ΔMoveNet-TRAIN] No training rows were built. "
+        "Ensure train_log_df has adjacent action tuples on the 27× grid per (source, question)."
+    )
+
+X_tr_all = np.stack(X_rows).astype(np.float32)     # [N, D_item+27]
+Y_tr_all = np.stack(Y_rows).astype(np.float32)     # [N, 6]
+M_tr_all = np.stack(M_rows).astype(np.float32)     # [N, 6]
+gk_tr    = np.array(K_rows)
+
+print(f"[ΔMoveNet-TRAIN] rows={len(X_tr_all)} | X_dim={X_tr_all.shape[1]} | " +
+      ", ".join(f"{m}={move_counts[m]}" for m in MOVES))
+
+# ---- Build classification labels ----
+Y_tr_bin = (Y_tr_all > 0.0).astype(np.float32)     # positive if delta>0
+S_tr     = (Y_tr_bin.sum(axis=1) < 0.5).astype(np.float32).reshape(-1,1)  # STOP=1 iff no positive neighbor
+
+mv_pos = (Y_tr_bin * M_tr_all).sum(axis=0) + 1e-6
+mv_neg = (M_tr_all.sum(axis=0) - (Y_tr_bin * M_tr_all).sum(axis=0)) + 1e-6
+mv_pos_weight = (mv_neg / mv_pos).astype(np.float32)
+
+stop_pos = float(S_tr.sum())
+stop_neg = float(len(S_tr) - stop_pos)
+stop_pos_weight = np.float32((stop_neg + 1e-6)/(stop_pos + 1e-6))
+
+train_avg = (tr_std.assign(_action_tuple=tr_std["action_idx"].apply(lambda i: idx_to_action(int(i))))
+               .groupby(["_src_norm","_qry_norm","_action_tuple"], as_index=False)["reward_1"].mean())
+precomp_idx_train = (train_avg
+                     .set_index(["_src_norm","_qry_norm","_action_tuple"])
+                     .sort_index())
